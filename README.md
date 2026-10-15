@@ -15,10 +15,9 @@ Windows 上以**桌面客户端**（独立应用窗口）方式运行。
 
 1. 安装 **Python 3.14**（勾选 *Add Python to PATH*）
    <https://www.python.org/downloads/>
-   > 仓库自带 `libs/` 离线依赖为 **cp314** 编译，务必使用 3.14；其他版本请执行
-   > `python -m pip install -r monitor/requirements.txt`
 2. 双击 **`start-cortech.bat`**
 
+   - **首次运行自动把依赖装到 `libs/`**（一次性，需联网；约 250MB）；此后完全离线可用；
    - 后台拉起服务（`127.0.0.1:8000`），并以**无地址栏的应用窗口**打开界面；
    - **关闭窗口即自动停止服务**；
    - 停止/排查：`stop-cortech.bat`，运行日志见 `data/desktop.log`。
@@ -31,11 +30,15 @@ Windows 上以**桌面客户端**（独立应用窗口）方式运行。
 ### Linux / macOS
 
 ```bash
-python3 -m pip install -r monitor/requirements.txt   # 需 Python 3.10+
-./start-cortech.sh                                    # 停止：./stop-cortech.sh
+./start-cortech.sh    # 首次运行同样自动装依赖到 libs/（需 Python 3.10+）
+./stop-cortech.sh     # 停止
 ```
 
-**系统要求**：内存 4GB+（推荐 8GB），磁盘 500MB+，采集与 AI 功能需要联网。
+**系统要求**：内存 4GB+（推荐 8GB），磁盘 500MB+（含依赖），采集与 AI 功能需要联网。
+
+> **依赖说明**：`libs/` 是离线依赖目录，体积较大，**不进 git 仓库**（见 `.gitignore`），
+> 由启动脚本在首次运行时自动生成。若需手动安装：
+> `python -m pip install --target libs -r monitor/requirements.txt`。
 
 ---
 
@@ -136,7 +139,9 @@ AI key 有两种配置方式，效果等同：
 ## 自检
 
 ```bash
-python -m monitor.verify_all      # 全链路验证：采集引擎/时间铁律/情感/趋势/报告/导出/AI/去重
+# 全链路验证：采集引擎 / 时间铁律 / 情感 / 趋势 / 报告 / 导出 / AI / 去重
+set PYTHONPATH=libs && python -m monitor.verify_all       # Windows
+PYTHONPATH=libs python -m monitor.verify_all              # Linux / macOS
 ```
 
 ---

@@ -17,9 +17,15 @@ fi
 mkdir -p data
 
 if ! "$PY" -c "import fastapi, uvicorn" >/dev/null 2>&1; then
-  echo "[错误] 缺少依赖，请先执行："
-  echo "       $PY -m pip install -r monitor/requirements.txt"
-  exit 1
+  echo "首次运行，正在安装依赖到 libs/ ...（一次性，需要联网）"
+  "$PY" -m pip install --disable-pip-version-check -q --target "$PWD/libs" -r monitor/requirements.txt
+  export PYTHONPATH="$PWD/libs${PYTHONPATH:+:$PYTHONPATH}"
+  export PYTHONNOUSERSITE=1
+  if ! "$PY" -c "import fastapi, uvicorn" >/dev/null 2>&1; then
+    echo "[错误] 依赖安装失败，请检查网络后重试。"
+    exit 1
+  fi
+  echo "依赖安装完成。"
 fi
 
 if curl -fsS -m 2 "http://$HOST:$PORT/api/auth/status" >/dev/null 2>&1; then
