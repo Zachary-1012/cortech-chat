@@ -1,0 +1,13 @@
+# 统一行尾，避免跨平台检出后脚本无法执行
+* text=auto
+*.sh  text eol=lf
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# 二进制资源不做文本转换
+*.png binary
+*.jpg binary
+*.ico binary
+*.woff binary
+*.woff2 binary
+*.ttf binary
