@@ -1,0 +1,261 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>太古汇小红书舆情监控站</title>
+<style>
+  * { box-sizing: border-box; }
+  body { font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; margin: 0; background: #f5f6f8; color: #222; }
+  header { background: #c8161d; color: #fff; padding: 14px 24px; display: flex; align-items: center; justify-content: space-between; }
+  header h1 { margin: 0; font-size: 20px; }
+  #loginBadge { font-size: 13px; background: rgba(255,255,255,.2); padding: 4px 12px; border-radius: 12px; }
+  main { max-width: 1200px; margin: 0 auto; padding: 20px; }
+  section.card { background: #fff; border-radius: 8px; padding: 18px 20px; margin-bottom: 18px; box-shadow: 0 1px 3px rgba(0,0,0,.08); }
+  section.card h2 { margin: 0 0 12px; font-size: 16px; border-left: 4px solid #c8161d; padding-left: 8px; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { border-bottom: 1px solid #eee; padding: 8px 6px; text-align: left; vertical-align: top; }
+  th { background: #fafafa; color: #666; font-weight: 600; }
+  tr.neg td { background: #fff1f0; }
+  tr.neg td:first-child { border-left: 3px solid #c8161d; }
+  .tag { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 12px; }
+  .tag.negative { background: #fde2e2; color: #c8161d; }
+  .tag.neutral { background: #eee; color: #666; }
+  .tag.positive { background: #e6f7e6; color: #1a7f37; }
+  .btn { background: #c8161d; color: #fff; border: none; border-radius: 4px; padding: 6px 14px; cursor: pointer; font-size: 13px; }
+  .btn:hover { opacity: .9; }
+  .btn.ghost { background: #fff; color: #333; border: 1px solid #ddd; }
+  .btn:disabled { opacity: .5; cursor: not-allowed; }
+  .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+  input, select { padding: 6px 8px; border: 1px solid #ddd; border-radius: 4px; font-size: 13px; }
+  .stat-boxes { display: flex; gap: 12px; margin-bottom: 12px; flex-wrap: wrap; }
+  .stat { flex: 1; min-width: 140px; background: #fafafa; border-radius: 6px; padding: 12px; text-align: center; }
+  .stat .num { font-size: 26px; font-weight: 700; }
+  .stat .lbl { font-size: 12px; color: #888; margin-top: 4px; }
+  #drawer { position: fixed; right: 0; top: 0; width: min(520px, 92vw); height: 100%; background: #fff;
+            box-shadow: -2px 0 8px rgba(0,0,0,.15); transform: translateX(105%); transition: transform .25s;
+            display: flex; flex-direction: column; z-index: 50; }
+  #drawer.open { transform: none; }
+  #drawer header { background: #333; padding: 12px 16px; }
+  #drawerBody { overflow-y: auto; padding: 14px 16px; flex: 1; }
+  .comment { border-bottom: 1px solid #f0f0f0; padding: 10px 0; font-size: 13px; }
+  .comment .meta { color: #999; font-size: 12px; margin-top: 4px; }
+  #overlay { position: fixed; inset: 0; background: rgba(0,0,0,.3); display: none; z-index: 40; }
+  #overlay.show { display: block; }
+  .status-dot { display:inline-block; width:8px; height:8px; border-radius:50%; margin-right:4px; }
+  .st-running { background:#faad14; } .st-done { background:#52c41a; } .st-failed { background:#f5222d; } .st-queued { background:#1890ff; }
+  pre.log { background:#1e1e1e; color:#d4d4d4; padding:10px; border-radius:6px; font-size:12px; max-height:220px; overflow:auto; white-space:pre-wrap; }
+  .muted { color:#999; font-size:12px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>🔍 太古汇小红书舆情监控站</h1>
+  <span id="loginBadge">登录态检测中…</span>
+</header>
+<main>
+  <section class="card">
+    <h2>话题管理</h2>
+    <div class="row" style="margin-bottom:12px">
+      <input id="f_name" placeholder="话题名称" style="width:220px">
+      <input id="f_kw" placeholder="关键词（英文逗号分隔）" style="width:300px">
+      <input id="f_max" type="number" value="50" min="1" max="500" style="width:90px" title="每关键词最大帖子数">
+      <label class="muted"><input type="checkbox" id="f_comments" checked> 采集评论</label>
+      <input id="f_cron" value="0 2 * * *" style="width:110px" title="cron 定时规则">
+      <button class="btn" onclick="createTopic()">＋ 新增话题</button>
+    </div>
+    <table><thead><tr><th>ID</th><th>话题</th><th>关键词</th><th>最大帖子</th><th>评论</th><th>定时</th><th>启用</th><th>操作</th></tr></thead>
+    <tbody id="topicBody"></tbody></table>
+  </section>
+
+  <section class="card">
+    <h2>采集任务 <button class="btn ghost" onclick="loadTasks()">刷新</button></h2>
+    <table><thead><tr><th>ID</th><th>话题</th><th>状态</th><th>开始</th><th>结束</th><th>入库帖子</th><th>错误</th><th>操作</th></tr></thead>
+    <tbody id="taskBody"></tbody></table>
+    <div id="taskLogWrap" style="margin-top:10px; display:none">
+      <div class="muted">任务日志（最近 60 行）：</div>
+      <pre class="log" id="taskLog"></pre>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>舆情统计</h2>
+    <div class="row" style="margin-bottom:12px">
+      <select id="statTopic"><option value="">全部话题</option></select>
+      <button class="btn" onclick="loadStats()">统计</button>
+      <button class="btn ghost" onclick="exportCSV()">导出 CSV</button>
+    </div>
+    <div class="stat-boxes">
+      <div class="stat"><div class="num" id="s_notes">-</div><div class="lbl">帖子总数</div></div>
+      <div class="stat"><div class="num" id="s_comments">-</div><div class="lbl">评论总数</div></div>
+      <div class="stat"><div class="num" id="s_neg" style="color:#c8161d">-</div><div class="lbl">负面帖子</div></div>
+      <div class="stat"><div class="num" id="s_neu" style="color:#888">-</div><div class="lbl">中性帖子</div></div>
+      <div class="stat"><div class="num" id="s_pos" style="color:#1a7f37">-</div><div class="lbl">正面帖子</div></div>
+    </div>
+    <canvas id="distChart" width="560" height="160" style="max-width:100%"></canvas>
+    <h3 style="font-size:14px">负面 Top10（按热度）</h3>
+    <table><thead><tr><th>标题</th><th>作者</th><th>点赞</th><th>评论</th><th>关键词</th><th>链接</th></tr></thead>
+    <tbody id="negTopBody"></tbody></table>
+  </section>
+
+  <section class="card">
+    <h2>帖子列表</h2>
+    <div class="row" style="margin-bottom:12px">
+      <select id="q_topic"><option value="">全部话题</option></select>
+      <select id="q_sent"><option value="">全部情感</option><option value="negative">负面</option><option value="neutral">中性</option><option value="positive">正面</option></select>
+      <input id="q_kw" placeholder="关键词搜索标题/描述/作者" style="width:240px">
+      <button class="btn" onclick="loadNotes(1)">查询</button>
+    </div>
+    <table><thead><tr><th>情感</th><th>标题 / 描述</th><th>作者</th><th>发布时间</th><th>赞/藏/评</th><th>操作</th></tr></thead>
+    <tbody id="noteBody"></tbody></table>
+    <div class="row" style="margin-top:10px">
+      <button class="btn ghost" onclick="loadNotes(notePage-1)">上一页</button>
+      <span class="muted" id="notePager"></span>
+      <button class="btn ghost" onclick="loadNotes(notePage+1)">下一页</button>
+    </div>
+  </section>
+</main>
+
+<div id="overlay" onclick="closeDrawer()"></div>
+<aside id="drawer">
+  <header><h1 style="font-size:15px" id="drawerTitle">评论</h1><button class="btn ghost" onclick="closeDrawer()">关闭</button></header>
+  <div id="drawerBody"></div>
+</aside>
+
+<script>
+const $ = id => document.getElementById(id);
+let notePage = 1, noteTotal = 0;
+const SENT_TXT = {negative:'负面', neutral:'中性', positive:'正面'};
+const fmtT = ts => ts ? new Date(ts*1000).toLocaleString('zh-CN',{hour12:false}) : '-';
+const esc = s => String(s||'').replace(/[&<>"]/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+
+async function api(path, opts={}) {
+  const r = await fetch(path, {headers:{'Content-Type':'application/json'}, ...opts});
+  if (!r.ok) { const t = await r.text(); throw new Error(t || r.status); }
+  return r.json();
+}
+
+// 登录态（兼容新版 /api/login-status 返回 {engines:[...]}）
+api('/api/login-status').then(d => {
+  const engines = d.engines || [];
+  const ok = engines.filter(e => e.login_ok).map(e => e.title);
+  $('loginBadge').textContent = ok.length ? `✅ 已登录（${ok.join('、')}）` : '⚠️ 未登录，请先扫码';
+  $('loginBadge').title = engines.map(e => `${e.title}：${e.login_hint}`).join('\n');
+}).catch(()=>{ $('loginBadge').textContent = '登录态检测失败'; });
+
+// 话题
+async function loadTopics() {
+  const d = await api('/api/topics');
+  $('topicBody').innerHTML = d.items.map(t => `<tr>
+    <td>${t.id}</td><td>${esc(t.name)}</td><td class="muted">${esc(t.keywords)}</td>
+    <td>${t.max_notes}</td><td>${t.enable_comments?'是':'否'}</td>
+    <td class="muted">${esc(t.cron)}</td><td>${t.enabled?'✅':'❌'}</td>
+    <td><button class="btn" onclick="triggerCrawl(${t.id}, this)">采集</button>
+    <button class="btn ghost" onclick="toggleTopic(${t.id}, ${t.enabled?0:1})">${t.enabled?'停用':'启用'}</button>
+    <button class="btn ghost" onclick="deleteTopic(${t.id})">删除</button></td></tr>`).join('');
+  const opts = d.items.map(t => `<option value="${t.id}">${esc(t.name)}</option>`).join('');
+  $('statTopic').innerHTML = '<option value="">全部话题</option>' + opts;
+  $('q_topic').innerHTML = '<option value="">全部话题</option>' + opts;
+}
+async function createTopic() {
+  const body = {name:$('f_name').value.trim(), keywords:$('f_kw').value.trim(),
+    max_notes:+$('f_max').value||50, enable_comments:$('f_comments').checked?1:0, cron:$('f_cron').value.trim()||'0 2 * * *'};
+  if (!body.name || !body.keywords) return alert('请填写话题名称和关键词');
+  await api('/api/topics', {method:'POST', body:JSON.stringify(body)});
+  $('f_name').value=''; $('f_kw').value=''; loadTopics();
+}
+async function toggleTopic(id, enabled) { await api(`/api/topics/${id}`, {method:'PATCH', body:JSON.stringify({enabled})}); loadTopics(); }
+async function deleteTopic(id) { if (confirm('删除话题（已采集数据保留）？')) { await api(`/api/topics/${id}`, {method:'DELETE'}); loadTopics(); } }
+async function triggerCrawl(id, btn) {
+  btn.disabled = true;
+  try { const d = await api(`/api/topics/${id}/crawl`, {method:'POST', body:'{}'}); alert('采集任务已启动，任务ID：'+d.task_id); loadTasks(); }
+  catch(e){ alert('启动失败：'+e.message); } finally { btn.disabled = false; }
+}
+
+// 任务
+const ST_TXT = {queued:'排队中', running:'采集中', done:'完成', failed:'失败'};
+async function loadTasks() {
+  const d = await api('/api/tasks');
+  $('taskBody').innerHTML = d.items.map(t => `<tr>
+    <td>${t.id}</td><td>${esc(t.topic_name||t.topic_id)}</td>
+    <td><span class="status-dot st-${t.status}"></span>${ST_TXT[t.status]||t.status}</td>
+    <td class="muted">${fmtT(t.started_at)}</td><td class="muted">${fmtT(t.finished_at)}</td>
+    <td>${t.notes_count||0}</td><td class="muted">${esc(t.error||'')}</td>
+    <td><button class="btn ghost" onclick="showLog(${t.id})">日志</button></td></tr>`).join('');
+}
+async function showLog(id) {
+  const t = await api(`/api/tasks/${id}`);
+  $('taskLog').textContent = t.log_tail || '(无日志)';
+  $('taskLogWrap').style.display = 'block';
+  $('taskLogWrap').scrollIntoView();
+}
+
+// 统计
+function drawDist(dist) {
+  const c = $('distChart'), ctx = c.getContext('2d');
+  ctx.clearRect(0,0,c.width,c.height);
+  const items = [['负面',dist.negative,'#c8161d'],['中性',dist.neutral,'#999'],['正面',dist.positive,'#1a7f37']];
+  const max = Math.max(1, ...items.map(i=>i[1]));
+  items.forEach((it,i) => {
+    const y = 20 + i*48, w = (c.width-160) * it[1]/max;
+    ctx.fillStyle = '#333'; ctx.font = '14px sans-serif'; ctx.fillText(it[0], 10, y+16);
+    ctx.fillStyle = it[2]; ctx.fillRect(70, y, w, 24);
+    ctx.fillStyle = '#333'; ctx.fillText(it[1], 80+w, y+16);
+  });
+}
+async function loadStats() {
+  const tid = $('statTopic').value;
+  const d = await api('/api/stats' + (tid?`?topic_id=${tid}`:''));
+  $('s_notes').textContent = d.total_notes; $('s_comments').textContent = d.total_comments;
+  $('s_neg').textContent = d.sentiment_dist.negative; $('s_neu').textContent = d.sentiment_dist.neutral; $('s_pos').textContent = d.sentiment_dist.positive;
+  drawDist(d.sentiment_dist);
+  $('negTopBody').innerHTML = d.negative_top10.map(n => `<tr class="neg">
+    <td>${esc(n.title||'(无标题)')}</td><td>${esc(n.author)}</td><td>${n.liked_count}</td><td>${n.comment_count}</td>
+    <td class="muted">${esc(n.source_keyword)}</td>
+    <td>${n.note_url?`<a href="${esc(n.note_url)}" target="_blank">打开</a>`:''}</td></tr>`).join('')
+    || '<tr><td colspan="6" class="muted">暂无负面帖子</td></tr>';
+}
+function exportCSV() {
+  const tid = $('statTopic').value, sent = $('q_sent').value;
+  let url = '/api/export.csv?';
+  if (tid) url += `topic_id=${tid}&`;
+  if (sent) url += `sentiment=${sent}`;
+  window.open(url, '_blank');
+}
+
+// 帖子
+async function loadNotes(p) {
+  notePage = Math.max(1, p||1);
+  const params = new URLSearchParams({page:notePage, page_size:20});
+  if ($('q_topic').value) params.set('topic_id', $('q_topic').value);
+  if ($('q_sent').value) params.set('sentiment', $('q_sent').value);
+  if ($('q_kw').value.trim()) params.set('q', $('q_kw').value.trim());
+  const d = await api('/api/notes?' + params);
+  noteTotal = d.total;
+  $('noteBody').innerHTML = d.items.map(n => `<tr class="${n.sentiment==='negative'?'neg':''}">
+    <td><span class="tag ${n.sentiment}">${SENT_TXT[n.sentiment]}</span></td>
+    <td><b>${esc(n.title||'(无标题)')}</b><br><span class="muted">${esc((n.desc||'').slice(0,120))}</span></td>
+    <td>${esc(n.author)}</td><td class="muted">${fmtT(n.publish_time)}</td>
+    <td>${n.liked_count}/${n.collected_count}/${n.comment_count}</td>
+    <td><button class="btn ghost" onclick="openComments('${n.post_id}', this)">评论</button>
+    ${n.note_url?`<a href="${esc(n.note_url)}" target="_blank">原文</a>`:''}</td></tr>`).join('')
+    || '<tr><td colspan="6" class="muted">暂无数据</td></tr>';
+  $('notePager').textContent = `第 ${d.page} 页 / 共 ${d.total} 条`;
+}
+async function openComments(post_id, btn) {
+  $('drawerTitle').textContent = '评论 · ' + post_id;
+  $('drawerBody').innerHTML = '<p class="muted">加载中…</p>';
+  $('drawer').classList.add('open'); $('overlay').classList.add('show');
+  const d = await api(`/api/posts/${post_id}/comments?page_size=100`);
+  $('drawerBody').innerHTML = d.items.map(c => `<div class="comment">
+    <span class="tag ${c.sentiment}">${SENT_TXT[c.sentiment]}</span> ${esc(c.content)}
+    <div class="meta">${esc(c.author)} · ${fmtT(c.create_time)} · 👍${c.like_count}</div></div>`).join('')
+    || '<p class="muted">暂无评论</p>';
+}
+function closeDrawer() { $('drawer').classList.remove('open'); $('overlay').classList.remove('show'); }
+
+loadTopics().then(()=>{ loadTasks(); loadStats(); loadNotes(1); });
+setInterval(loadTasks, 10000);
+</script>
+</body>
+</html>

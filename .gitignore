@@ -1,0 +1,38 @@
+# ---------------- Python ----------------
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# ---------------- 内置依赖包 ----------------
+# libs/ 是随包分发的离线依赖（约 140MB，含 cp314-win_amd64 .pyd 二进制），不入库。
+# 需要时执行：python -m pip install --target libs -r monitor/requirements.txt
+libs/
+
+# ---------------- 运行时数据 ----------------
+# SQLite 库、采集运行目录、上传的举报材料、桌面版浏览器 profile
+data/
+
+# ---------------- 密钥（绝不入库） ----------------
+# AI Provider key / SMTP 授权码等本地密钥，只保留 monitor/.env.example 模板
+monitor/.env
+.env
+*.key
+*.pem
+
+# ---------------- 日志 ----------------
+*.log
+logs/
+
+# ---------------- 前端 ----------------
+node_modules/
+# 注意：frontend/dist 是后端托管的构建产物，必须入库，不在此忽略
+
+# ---------------- 编辑器 / 系统 ----------------
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+desktop.ini
