@@ -85,6 +85,22 @@ def share_count_meta(interact: Dict[str, Any] | None) -> Tuple[int, bool, Dict[s
     }
 
 
+def engagement_of(note: Dict[str, Any]) -> Tuple[int, str]:
+    """互动量。网页端明确没有分享数时，不把 0 算进互动，文案标明未返回。"""
+    liked = int(note.get("liked_count") or 0)
+    collected = int(note.get("collected_count") or 0)
+    comments = int(note.get("comment_count") or 0)
+    share = int(note.get("share_count") or 0)
+    flag = note.get("share_count_available")
+    if flag in (0, False, "0"):
+        total = liked + collected + comments
+        share_text = "分享（网页端未返回）"
+    else:
+        total = liked + collected + comments + share
+        share_text = f"分享{share}"
+    return total, f"点赞{liked}/收藏{collected}/评论{comments}/{share_text}"
+
+
 def failure_kind_from_message(message: str) -> str:
     text = message or ""
     if any(s in text for s in ("登录失效", "重新扫码", "Cookie 缺少", "尚未扫码", "无登录数据")):

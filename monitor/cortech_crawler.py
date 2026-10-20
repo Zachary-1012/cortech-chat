@@ -175,15 +175,12 @@ def convert_cookies(cookies: list) -> Tuple[str, Dict[str, str]]:
 
 
 def cookies_from_state_dict(state: Dict[str, Any]) -> Tuple[str, Dict[str, str]]:
-    """从用户已保存的 storage_state 读取 Cookie，不启动浏览器。"""
-    picked = []
-    for c in state.get("cookies") or []:
-        if not isinstance(c, dict) or not c.get("name"):
-            continue
-        domain = str(c.get("domain") or "")
-        if domain and "xiaohongshu" not in domain:
-            continue
-        picked.append(c)
+    """从用户已保存的 storage_state 读取 Cookie，不启动浏览器。
+
+    .com / .cn / .hk 都收；同名时 .com 优先。其它域名丢掉。
+    """
+    from .xhs_hosts import merge_cookie_rows
+    picked = merge_cookie_rows(state.get("cookies") or [])
     return convert_cookies(picked)
 
 
@@ -210,7 +207,8 @@ async def _read_login_cookies(profile_dir=None) -> Tuple[str, Dict[str, str]]:
                     user_data_dir=str(cache), headless=True,
                     args=["--no-sandbox", "--disable-blink-features=AutomationControlled"])
                 try:
-                    cookies = await ctx2.cookies("https://www.xiaohongshu.com")
+                    from .xhs_hosts import collect_context_cookies
+                    cookies = await collect_context_cookies(ctx2)
                 finally:
                     await ctx2.close()
                 return convert_cookies(cookies)

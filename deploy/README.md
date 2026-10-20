@@ -48,4 +48,4 @@ curl -fsS http://127.0.0.1:8000/health
 | 样例闭环 | `CORTECH_COLLECTION_FIXTURE=1`，再对某个话题点采集 | 不会。任务进度到 100，帖子列表和总览出现本地样例 |
 | 真实会话 | 关掉上面的开关。账号管理里用本人小红书扫码，或用 `extensions/cortech-xhs-assist` 确认后发送自己的登录态 | 会。没有有效登录态时接口返回 `need_xhs_session` |
 
-插件可以打成 zip：`./extensions/build-zip.sh`。
+插件可以打成 zip：`./extensions/build-zip.sh`。Windows 用 `powershell -File extensions\build-zip.ps1`。本机不想开桌面窗口时，用仓库根目录的 `start-saas.bat`（`CORTECH_SAAS=1`，浏览器打开 `http://127.0.0.1:8000`）。

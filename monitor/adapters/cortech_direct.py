@@ -84,9 +84,10 @@ async def _read_login_cookies(profile_dir=None) -> Tuple[str, Dict[str, str]]:
     from pathlib import Path
 
     async def _cookies_from_storage(browser, storage_state) -> list:
+        from ..xhs_hosts import collect_context_cookies
         ctx = await browser.new_context(storage_state=storage_state)
         try:
-            return await ctx.cookies("https://www.xiaohongshu.com")
+            return await collect_context_cookies(ctx)
         finally:
             await ctx.close()
 
@@ -111,7 +112,8 @@ async def _read_login_cookies(profile_dir=None) -> Tuple[str, Dict[str, str]]:
                         user_data_dir=str(cache), headless=True,
                         args=["--no-sandbox", "--disable-blink-features=AutomationControlled"])
                     try:
-                        cookies = await ctx2.cookies("https://www.xiaohongshu.com")
+                        from ..xhs_hosts import collect_context_cookies
+                        cookies = await collect_context_cookies(ctx2)
                     finally:
                         await ctx2.close()
                     from tools.crawler_util import convert_cookies

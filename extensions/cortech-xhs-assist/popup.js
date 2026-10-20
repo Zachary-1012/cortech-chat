@@ -37,6 +37,8 @@ function normalizeOrigin(raw) {
 }
 
 async function readOwnCookies() {
+  // .com 在前：大陆和香港网页通常都是 www.xiaohongshu.com。
+  // 只有浏览器里确实有 .cn / .hk 的登录 Cookie 时才会用到后面的域。
   const found = {};
   for (const domain of XHS_DOMAINS) {
     const rows = await chrome.cookies.getAll({ domain });

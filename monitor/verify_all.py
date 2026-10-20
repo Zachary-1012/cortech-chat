@@ -152,6 +152,26 @@ def main():
           bool(live) and all(r["publish_time"] != r["collected_at"] for r in live),
           f"added={fx['notes']}")
     check("删除笔记单独标记", bool(deleted))
+    st_fx = db.stats(tid)
+    check("总览带删除数、分享缺失和发布时间口径",
+          int(st_fx.get("deleted_notes") or 0) >= 1
+          and int(st_fx.get("active_notes") or 0) >= 1
+          and int(st_fx.get("share_not_on_web") or 0) >= 1
+          and (st_fx.get("time_basis") or {}).get("publish_time") == "发布时间"
+          and (st_fx.get("time_basis") or {}).get("collected_at") == "采集时间")
+    with alerts._connect() as conn:
+        window = alerts._task_window_notes(
+            conn, tid, int(time.time()) - 120, int(time.time()) + 60)
+    window_ids = {n["post_id"] for n in window}
+    check("预警窗口跳过已删除笔记",
+          any(str(i).startswith("fixture_live_") for i in window_ids)
+          and not any("fixture_deleted_" in str(i) for i in window_ids))
+    from monitor.xhs_errors import engagement_of
+    eng, eng_text = engagement_of({
+        "liked_count": 1, "collected_count": 2, "comment_count": 3,
+        "share_count": 9, "share_count_available": 0,
+    })
+    check("分享数 not_on_web 不计入互动", eng == 6 and "网页端未返回" in eng_text)
     with db._connect() as conn:
         conn.execute("DELETE FROM notes WHERE post_id LIKE 'fixture_%'")
 
@@ -313,7 +333,11 @@ def main():
         check("插件为 MV3 且不注入页面",
               manifest.get("manifest_version") == 3 and "content_scripts" not in manifest
               and "xiaohongshu.hk" in _json.dumps(manifest)
+              and "xiaohongshu.cn" in _json.dumps(manifest)
               and manifest.get("name", "").startswith("Cortech Chat"))
+        check("插件读取 com/cn/hk 且 com 优先",
+              popup_js.find("xiaohongshu.com") < popup_js.find("xiaohongshu.cn")
+              and "xiaohongshu.hk" in popup_js)
         check("插件需确认后才发送且不后台监听",
               "确认发送" in popup_html and "onChanged" not in popup_js
               and "chrome.alarms" not in popup_js and "cortechOrigin" in popup_js)
@@ -591,6 +615,204 @@ def main():
         else:
             os.environ["CORTECH_SAAS"] = saved_saas
         os.environ.pop("CORTECH_COLLECTION_FIXTURE", None)
+
+    # ---- 10. 主机矩阵 / 长任务进度 / 扫码状态机（不访问小红书） ----
+    from monitor.xhs_hosts import API_ORIGIN, COOKIE_READ_URLS, host_is_xhs, merge_cookie_rows
+    merged = merge_cookie_rows([
+        {"name": "a1", "value": "from-hk", "domain": ".xiaohongshu.hk"},
+        {"name": "a1", "value": "from-cn", "domain": ".xiaohongshu.cn"},
+        {"name": "a1", "value": "from-com", "domain": ".xiaohongshu.com"},
+        {"name": "web_session", "value": "only-hk", "domain": ".xiaohongshu.hk"},
+        {"name": "edith_only", "value": "edith-v", "domain": "edith.xiaohongshu.com"},
+        {"name": "noise", "value": "nope", "domain": ".example.com"},
+    ])
+    merged_map = {row["name"]: row["value"] for row in merged}
+    check("Cookie 同名优先 .com，并保留仅存在于 hk/edith 的项",
+          merged_map.get("a1") == "from-com"
+          and merged_map.get("web_session") == "only-hk"
+          and merged_map.get("edith_only") == "edith-v"
+          and "noise" not in merged_map
+          and host_is_xhs("www.xiaohongshu.cn")
+          and host_is_xhs("www.xiaohongshu.hk")
+          and not host_is_xhs("evil.example.com"))
+    check("采集读 Cookie 覆盖三个网页域和 edith",
+          "https://www.xiaohongshu.cn" in COOKIE_READ_URLS
+          and "https://www.xiaohongshu.hk" in COOKIE_READ_URLS
+          and API_ORIGIN == "https://edith.xiaohongshu.com")
+    import_src = (__import__("pathlib").Path(__file__).resolve().parent
+                  / "browser_import.py").read_text(encoding="utf-8")
+    check("浏览器导入 SQL 包含 cn 与 hk",
+          "xiaohongshu.cn" in import_src and "xiaohongshu.hk" in import_src)
+
+    from monitor.task_progress import present_task, record_task_progress
+    prog_task = db.create_task(tid, "cortech_crawler")
+    try:
+        record_task_progress(prog_task, 12, "第一页")
+        record_task_progress(prog_task, 4, "不应回退")
+        record_task_progress(prog_task, 12, "长任务仍在第一页")
+        record_task_progress(prog_task, -1, "补充说明而不清零")
+        shown = present_task(db.get_task(prog_task))
+        check("长任务进度不回退且说明可更新",
+              shown["progress"] == 12
+              and "补充说明" in shown["progress_detail"]
+              and shown["status_label"] == "排队中"
+              and "deleted_count" in shown and "updated_at" in shown
+              and shown["notes_count"] == 0 and shown["error"] == "")
+        db.update_task(prog_task, status="done", progress=96)
+        done_view = present_task(db.get_task(prog_task))
+        check("完成态进度对外显示 100",
+              done_view["progress"] == 100 and done_view["status_label"] == "采集完成")
+    finally:
+        with db._connect() as conn:
+            conn.execute("DELETE FROM tasks WHERE id=?", (prog_task,))
+
+    root = __import__("pathlib").Path(__file__).resolve().parent.parent
+    saas_bat = (root / "start-saas.bat").read_text(encoding="ascii")
+    check("Windows SaaS 启动脚本不打开桌面、不安装包",
+          "CORTECH_SAAS=1" in saas_bat
+          and "python -m monitor.app" in saas_bat
+          and "http://127.0.0.1:8000" in saas_bat
+          and "CORTECH_DATA_DIR" in saas_bat
+          and "CortechChat.py" not in saas_bat
+          and "pip " not in saas_bat.lower()
+          and "chcp" not in saas_bat.lower())
+    ps1 = (root / "extensions" / "build-zip.ps1").read_text(encoding="utf-8")
+    check("Windows 插件 zip 脚本",
+          "cortech-xhs-assist" in ps1 and "ZipFile" in ps1 and "manifest.json" in ps1)
+
+    from monitor.config import login_cache_dir
+    from monitor.login_flow import (apply_successful_login, get_manager,
+                                    set_launch_browser)
+    cache_file = login_cache_dir() / "storage_state.json"
+    cache_backup = cache_file.read_text(encoding="utf-8") if cache_file.exists() else None
+    set_launch_browser(False)
+    p3_email = f"p3-qr-{int(time.time())}@example.com"
+    aid = need_id = None
+    try:
+        from fastapi.testclient import TestClient
+        from monitor.app import app
+        import monitor.crawler_driver as crawl_mod
+        get_manager().clear_all()
+        os.environ.pop("CORTECH_COLLECTION_FIXTURE", None)
+        with TestClient(app) as client:
+            reg = client.post("/api/auth/register",
+                              json={"email": p3_email, "password": "secret1"})
+            check("扫码测试用户可注册", reg.status_code == 200, reg.text[:120])
+            created = client.post("/api/accounts")
+            body = created.json() if created.status_code == 200 else {}
+            login = body.get("login") or {}
+            aid = body.get("account_id")
+            check("创建账号返回等待扫码",
+                  created.status_code == 200 and login.get("state") == "waiting"
+                  and login.get("state_label") == "等待扫码"
+                  and login.get("ok") is False, created.text[:160])
+            if aid:
+                checked = client.post(f"/api/accounts/{aid}/check")
+                listed = client.get("/api/accounts").json()
+                row = next((i for i in listed.get("items") or [] if i["id"] == aid), {})
+                check("等待扫码时检查不把账号写成失效",
+                      checked.status_code == 200
+                      and checked.json().get("state") == "waiting"
+                      and row.get("status") == "pending"
+                      and row.get("state_label") == "等待扫码")
+                sess = get_manager().get_session(aid)
+                sess.mark("waiting", qrcode_b64="aGVsbG8=",
+                          message="请用小红书 App 扫码登录（120 秒内有效）")
+                qr = client.get("/api/login/qrcode", params={"account_id": aid})
+                check("二维码接口带等待状态",
+                      qr.status_code == 200
+                      and str(qr.json().get("image") or "").startswith("data:image/png;base64,")
+                      and qr.json().get("state") == "waiting"
+                      and qr.json().get("state_label") == "等待扫码")
+                sess.mark("expired", qrcode_b64="",
+                          message="二维码已过期，请重新获取")
+                expired = client.get("/api/login/status", params={"account_id": aid})
+                qr_gone = client.get("/api/login/qrcode", params={"account_id": aid})
+                check("二维码过期返回 expired",
+                      expired.status_code == 200
+                      and expired.json().get("state") == "expired"
+                      and expired.json().get("state_label") == "二维码已过期"
+                      and qr_gone.status_code == 404
+                      and qr_gone.json().get("state") == "expired")
+                rescanned = client.post(f"/api/accounts/{aid}/rescan")
+                check("重新扫码回到等待",
+                      rescanned.status_code == 200
+                      and rescanned.json().get("state") == "waiting"
+                      and rescanned.json().get("state_label") == "等待扫码")
+                db.set_current_user(reg.json()["id"])
+                try:
+                    need_id = db.create_account("待重扫")
+                    db.update_account(need_id, {
+                        "status": "expired", "check_note": "登录失效"})
+                finally:
+                    db.set_current_user(None)
+                get_manager().clear(need_id)
+                need = client.get("/api/login/status", params={"account_id": need_id})
+                check("失效账号对外是需要重新扫码",
+                      need.status_code == 200
+                      and need.json().get("account_id") == need_id
+                      and need.json().get("state") == "need_rescan"
+                      and need.json().get("state_label") == "需要重新扫码"
+                      and need.json().get("message") == "登录失效")
+                apply_successful_login(aid, {
+                    "cookies": [
+                        {"name": "a1", "value": "mockeda1value99", "domain": ".xiaohongshu.com"},
+                        {"name": "web_session", "value": "mockedwebsession99",
+                         "domain": ".xiaohongshu.com"},
+                    ],
+                    "origins": [],
+                }, nickname="扫码用户")
+                setup = client.get("/api/setup/status").json()
+                check("扫码成功后健康账号增加且不再要求会话",
+                      int(setup.get("xhs_accounts_healthy") or 0) >= 1
+                      and setup.get("collection", {}).get("code") == "xhs_ready"
+                      and setup.get("collection", {}).get("needs_real_xhs_session") is False)
+                topic = client.post("/api/topics", json={
+                    "name": "P3 扫码话题", "keywords": "样例", "max_notes": 3,
+                    "enable_comments": 0,
+                })
+
+                class _NoStart:
+                    def __init__(self, *args, **kwargs):
+                        pass
+
+                    def start(self):
+                        return None
+
+                old_thread = crawl_mod.threading.Thread
+                crawl_mod.threading.Thread = _NoStart
+                try:
+                    crawled = client.post(
+                        f"/api/topics/{topic.json()['id']}/crawl", json={})
+                    check("有效登录后采集不再返回 need_xhs_session",
+                          topic.status_code == 200 and crawled.status_code == 200
+                          and crawled.json().get("needs_real_xhs_session") is False
+                          and "need_xhs_session" not in crawled.text
+                          and "need_xhs_rescan" not in crawled.text,
+                          crawled.text[:180])
+                finally:
+                    crawl_mod.threading.Thread = old_thread
+    finally:
+        set_launch_browser(True)
+        get_manager().clear_all()
+        if cache_backup is None:
+            cache_file.unlink(missing_ok=True)
+        else:
+            cache_file.parent.mkdir(parents=True, exist_ok=True)
+            cache_file.write_text(cache_backup, encoding="utf-8")
+        with db._connect() as conn:
+            conn.execute("DELETE FROM notes WHERE topic_id IN "
+                         "(SELECT id FROM topics WHERE name='P3 扫码话题')")
+            conn.execute("DELETE FROM tasks WHERE topic_id IN "
+                         "(SELECT id FROM topics WHERE name='P3 扫码话题')")
+            conn.execute("DELETE FROM topics WHERE name='P3 扫码话题'")
+            if aid:
+                conn.execute("DELETE FROM xhs_accounts WHERE id=?", (aid,))
+            if need_id:
+                conn.execute("DELETE FROM xhs_accounts WHERE id=?", (need_id,))
+            conn.execute("DELETE FROM auth_sessions WHERE user_id IN "
+                         "(SELECT id FROM users WHERE email=?)", (p3_email,))
+            conn.execute("DELETE FROM users WHERE email=?", (p3_email,))
 
     # ---- 汇总 ----
     fails = [n for n, ok in results if not ok]

@@ -84,7 +84,9 @@ export CORTECH_SAAS=1
 5. 在这个浏览器打开小红书并登录自己的号，再点插件里的「预览我的昵称」。确认昵称后勾选确认，才会发送。
 6. 发送成功后，页面上不再保留 Cookie。服务端加密保存，并立刻做登录态健康检查。
 
-大陆和香港访问小红书网页，通常都是 `www.xiaohongshu.com`，Cookie 域名是 `.xiaohongshu.com`。插件同时识别 `.xiaohongshu.cn` 和 `.xiaohongshu.hk`：只有当你的浏览器里确实有这些域名的登录 Cookie 时才会读取。应用商店上架以后再补，现在用「加载已解压的扩展程序」。
+大陆和香港访问小红书网页，通常都是 `www.xiaohongshu.com`，Cookie 域名是 `.xiaohongshu.com`。插件同时识别 `.xiaohongshu.cn` 和 `.xiaohongshu.hk`：只有当你的浏览器里确实有这些域名的登录 Cookie 时才会读取。采集器读 Cookie 时会同时询问这三个网页域，以及 `edith.xiaohongshu.com` 上的 host-only Cookie；同名时采用 `.com`。签名请求仍然发到 `edith.xiaohongshu.com`。应用商店上架以后再补，现在用「加载已解压的扩展程序」。
+
+打成 zip：macOS / Linux 用 `./extensions/build-zip.sh`，Windows 用 `powershell -File extensions\build-zip.ps1`。压缩包根目录就是插件文件，解压后用「加载已解压的扩展程序」。
 
 可选：把你已经登录好的浏览器目录指给 `CORTECH_BROWSER_USE_PROFILE`，并设置 `CORTECH_ENABLE_BROWSER_USE=1`。采集会复用这份会话，排队和并发有上限。目录里没有 `a1` 和 `web_session` 时会拒绝，服务端不会代为登录。
 
@@ -103,6 +105,12 @@ export CORTECH_SAAS=1
 4. 可选：双击 `创建桌面快捷方式.bat`，在桌面生成带图标的 Cortech Chat 快捷方式。
 
 > 本机直接跑服务：`python -m monitor.app`（默认 `0.0.0.0:8000`），浏览器打开 <http://127.0.0.1:8000>。云上请改用上面的环境变量。
+
+### Windows 本地 SaaS（不打开桌面窗口）
+
+双击 **`start-saas.bat`**。它只做三件事：设置 `CORTECH_SAAS=1`、把数据目录设为项目下的 `data\`、运行 `python -m monitor.app`。不会打开桌面窗口。`libs\` 里已经有依赖时，这个脚本不会安装包。
+
+浏览器打开 <http://127.0.0.1:8000> 。关闭该命令行窗口即停止服务。
 
 ### Linux / macOS
 
