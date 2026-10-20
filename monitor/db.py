@@ -8,6 +8,7 @@ uid=None 表示系统上下文（不做过滤，仅服务端内部使用）。
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 import secrets
 import sqlite3
@@ -157,6 +158,9 @@ CREATE TABLE IF NOT EXISTS notes (
     sentiment_score REAL DEFAULT 0.5,
     collected_at INTEGER,
     created_at INTEGER NOT NULL,
+    post_status TEXT DEFAULT 'active',
+    share_count_available INTEGER,
+    field_meta TEXT DEFAULT '',
     UNIQUE(user_id, post_id)
 );
 CREATE TABLE IF NOT EXISTS comments (
@@ -274,6 +278,9 @@ _MIGRATIONS = {
         "media_type": "TEXT DEFAULT ''",
         "collected_at": "INTEGER",
         "publish_time_raw": "TEXT DEFAULT ''",
+        "post_status": "TEXT DEFAULT 'active'",
+        "share_count_available": "INTEGER",
+        "field_meta": "TEXT DEFAULT ''",
     },
     "comments": {
         "reply_count": "INTEGER DEFAULT 0",
@@ -308,6 +315,9 @@ _REBUILD_TABLES = {
     sentiment_score REAL DEFAULT 0.5,
     collected_at INTEGER,
     created_at INTEGER NOT NULL,
+    post_status TEXT DEFAULT 'active',
+    share_count_available INTEGER,
+    field_meta TEXT DEFAULT '',
     UNIQUE(user_id, post_id)
 )""",
     "comments": """CREATE TABLE comments (
@@ -401,6 +411,12 @@ def _migrate(conn: sqlite3.Connection) -> None:
             _rebuild_with_userid(conn, table, create_sql)
         except Exception:
             pass
+    # 重建会换掉表，列补丁再跑一遍，避免新列在重建后丢失
+    for table, cols in _MIGRATIONS.items():
+        existing = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+        for col, ddl in cols.items():
+            if col not in existing:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {ddl}")
     # 存量迁移：tasks.topic_id 去掉 NOT NULL（资讯任务无话题，用 NULL）
     cols = {r["name"]: r["notnull"] for r in
             conn.execute("PRAGMA table_info(tasks)").fetchall()}
@@ -818,8 +834,9 @@ def upsert_note(note: Dict[str, Any]) -> bool:
             "INSERT OR IGNORE INTO notes (user_id, post_id, topic_id, title, desc, author, author_id,"
             " fans_count, publish_time, publish_time_raw, ip_location, tags, media_type,"
             " liked_count, collected_count, comment_count, share_count, note_url, source_keyword,"
-            " sentiment, sentiment_score, collected_at, created_at)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            " sentiment, sentiment_score, collected_at, created_at,"
+            " post_status, share_count_available, field_meta)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 uid, note["post_id"], note["topic_id"], note.get("title", ""), note.get("desc", ""),
                 note.get("author", ""), note.get("author_id", ""),
@@ -831,6 +848,10 @@ def upsert_note(note: Dict[str, Any]) -> bool:
                 note.get("note_url", ""), note.get("source_keyword", ""),
                 note.get("sentiment", "neutral"), note.get("sentiment_score", 0.5),
                 note.get("collected_at", int(time.time())), int(time.time()),
+                note.get("post_status") or "active",
+                (1 if note.get("share_count_available") else 0),
+                note.get("field_meta") if isinstance(note.get("field_meta"), str)
+                else json.dumps(note.get("field_meta") or {}, ensure_ascii=False),
             ),
         )
         return cur.rowcount > 0
@@ -906,7 +927,7 @@ def list_posts(topic_id: Optional[int] = None, sentiment: Optional[str] = None,
             f" LIMIT ? OFFSET ?", (*params, page_size, (page - 1) * page_size),
         ).fetchall()
         return {"total": total, "page": page, "page_size": page_size,
-                "items": [dict(r) for r in rows]}
+                "items": [_public_note(r) for r in rows]}
 
 
 def list_comments(post_id: str, page: int = 1, page_size: int = 50) -> Dict[str, Any]:
@@ -1115,6 +1136,42 @@ def get_default_account() -> Optional[Dict[str, Any]]:
             params,
         ).fetchone()
         return dict(row) if row else None
+
+
+def list_valid_accounts_lru() -> List[Dict[str, Any]]:
+    """有效账号，按最久未使用排在前面，供采集轮询。"""
+    where, params = ["status='valid'"], []
+    _uw(where, params)
+    with _connect() as conn:
+        rows = conn.execute(
+            f"SELECT * FROM xhs_accounts WHERE {' AND '.join(where)}"
+            " ORDER BY last_used_at ASC, id ASC",
+            params,
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def next_collection_account() -> Optional[Dict[str, Any]]:
+    """采集轮询：选最久未使用的有效账号。没有则返回 None。"""
+    rows = list_valid_accounts_lru()
+    return rows[0] if rows else None
+
+
+def _public_note(row: sqlite3.Row) -> Dict[str, Any]:
+    d = dict(row)
+    raw = d.get("field_meta") or ""
+    if isinstance(raw, str) and raw.strip():
+        try:
+            d["field_meta"] = json.loads(raw)
+        except Exception:
+            d["field_meta"] = {}
+    elif not isinstance(raw, dict):
+        d["field_meta"] = {}
+    if "share_count_available" in d and d["share_count_available"] is not None:
+        d["share_count_available"] = bool(d["share_count_available"])
+    if not d.get("post_status"):
+        d["post_status"] = "active"
+    return d
 
 
 # ---------------- news ----------------

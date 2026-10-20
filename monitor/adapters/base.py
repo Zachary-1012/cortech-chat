@@ -37,6 +37,11 @@ class NoteData:
     collected_count: int = 0
     comment_count: int = 0
     share_count: int = 0
+    # False：网页端没有该字段，0 不是真实分享数
+    share_count_available: bool = False
+    field_meta: dict = field(default_factory=dict)
+    # active：正常笔记；deleted：404/已删除，入库展示，不算采集失败
+    post_status: str = "active"
     media_type: str = ""      # image / video
     note_url: str = ""
     source_keyword: str = ""
@@ -83,6 +88,8 @@ class CrawlContext:
 class CrawlResult:
     notes: List[NoteData] = field(default_factory=list)
     comments: List[CommentData] = field(default_factory=list)
+    deleted_count: int = 0
+    detail_skipped: int = 0
 
 
 class AdapterNotSupported(Exception):

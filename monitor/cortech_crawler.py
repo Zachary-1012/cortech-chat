@@ -7,8 +7,8 @@
 - spider_xhs.py：作者信息补采（粉丝数/获赞数/笔记数/IP属地）
 - xhs_downloader.py：下载器定位，不做采集（crawl 本就抛 NotSupported），已剔除
 
-签名算法：xhshow 纯 Python 库（MIT，Cloxl/xhshow），经 MediaCrawler 的
-playwright_sign.py 验证为当前最全实现（X-S/X-T/x-S-Common/X-B3-Traceid 四头）。
+签名算法：xhshow 纯 Python 库（MIT，Cloxl/xhshow），
+生成 X-S / X-T / x-S-Common / X-B3-Traceid 四头。
 """
 from __future__ import annotations
 
@@ -23,7 +23,8 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import httpx
 
 from . import _xhs
-from .config import BASE_DIR, login_cache_dir
+from .config import active_login_cache_dir
+from .xhs_errors import classify_biz_code, classify_http_status, share_count_meta
 
 # ---- 风控参数（来自 direct_api.py） ----
 REQUEST_INTERVAL_SEC = 1.5
@@ -86,6 +87,9 @@ class NoteData:
     collected_count: int = 0
     comment_count: int = 0
     share_count: int = 0
+    share_count_available: bool = False
+    field_meta: Dict[str, Any] = field(default_factory=dict)
+    post_status: str = "active"
     media_type: str = ""
     note_url: str = ""
     source_keyword: str = ""
@@ -128,6 +132,8 @@ class CrawlContext:
 class CrawlResult:
     notes: List[NoteData] = field(default_factory=list)
     comments: List[CommentData] = field(default_factory=list)
+    deleted_count: int = 0
+    detail_skipped: int = 0
 
 
 # ============ 工具函数（来自 direct_api.py） ============
@@ -154,13 +160,13 @@ def _to_ts(v: Any) -> Optional[int]:
 
 
 def _get_search_id() -> str:
-    """生成 search_id（来自 MediaCrawler help.py）"""
+    """生成 search_id。"""
     import random
     return "".join(random.choices("0123456789abcdef", k=32))
 
 
 def convert_cookies(cookies: list) -> Tuple[str, Dict[str, str]]:
-    """Cookie 列表转字符串+字典（来自 MediaCrawler tools/crawler_util.py）"""
+    """Cookie 列表转字符串和字典。"""
     if not cookies:
         return "", {}
     cookies_str = ";".join(f"{c.get('name')}={c.get('value')}" for c in cookies)
@@ -168,31 +174,37 @@ def convert_cookies(cookies: list) -> Tuple[str, Dict[str, str]]:
     return cookies_str, cookie_dict
 
 
+def cookies_from_state_dict(state: Dict[str, Any]) -> Tuple[str, Dict[str, str]]:
+    """从用户已保存的 storage_state 读取 Cookie，不启动浏览器。"""
+    picked = []
+    for c in state.get("cookies") or []:
+        if not isinstance(c, dict) or not c.get("name"):
+            continue
+        domain = str(c.get("domain") or "")
+        if domain and "xiaohongshu" not in domain:
+            continue
+        picked.append(c)
+    return convert_cookies(picked)
+
+
 async def _read_login_cookies(profile_dir=None) -> Tuple[str, Dict[str, str]]:
-    """headless 读取扫码登录缓存（来自 direct_api.py，原样保留）"""
+    """读取扫码或握手保存的登录缓存。storage_state.json 不需要浏览器。"""
+    cache = Path(profile_dir) if profile_dir else active_login_cache_dir()
+    state_file = cache / "storage_state.json"
+    if state_file.exists():
+        state = json.loads(state_file.read_text(encoding="utf-8"))
+        return cookies_from_state_dict(state)
     try:
         from playwright.async_api import async_playwright
     except ImportError:
-        raise RuntimeError("playwright 未安装")
-
-    async def _cookies_from_storage(browser, storage_state) -> list:
-        ctx = await browser.new_context(storage_state=storage_state)
-        try:
-            return await ctx.cookies("https://www.xiaohongshu.com")
-        finally:
-            await ctx.close()
+        raise RuntimeError("未找到 storage_state.json，且 playwright 未安装，无法读取浏览器 profile")
 
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(
             headless=True,
             args=["--no-sandbox", "--disable-blink-features=AutomationControlled"])
         try:
-            cache = Path(profile_dir) if profile_dir else login_cache_dir()
-            state_file = cache / "storage_state.json"
-            if state_file.exists():
-                cookies = await _cookies_from_storage(
-                    browser, json.loads(state_file.read_text(encoding="utf-8")))
-            elif cache.exists() and any(cache.iterdir()):
+            if cache.exists() and any(cache.iterdir()):
                 await browser.close()
                 ctx2 = await pw.chromium.launch_persistent_context(
                     user_data_dir=str(cache), headless=True,
@@ -202,23 +214,30 @@ async def _read_login_cookies(profile_dir=None) -> Tuple[str, Dict[str, str]]:
                 finally:
                     await ctx2.close()
                 return convert_cookies(cookies)
-            else:
-                raise RuntimeError("未检测到扫码登录缓存，请先在「账号管理」完成扫码登录")
+            raise RuntimeError("未检测到扫码登录缓存，请先在「账号管理」完成扫码登录")
         finally:
             try:
                 await browser.close()
             except Exception:
                 pass
-    return convert_cookies(cookies)
 
 
-# ============ HTTP 客户端（精简自 MediaCrawler client.py） ============
+def _raise_xhs_kind(kind: str, human: str) -> None:
+    if kind == "deleted":
+        raise _xhs.NoteNotFoundError(human)
+    if kind == "login":
+        raise _xhs.PlatformAccessError(human)
+    if kind == "risk":
+        raise _xhs.IPBlockError(human)
+    raise _xhs.DataFetchError(human)
+
+
+# ============ HTTP 客户端 ============
 
 class XHSClient:
-    """小红书 direct-API 客户端（精简版，只保留 Cortech 需要的方法）
+    """小红书网页 direct-API 客户端（Cortech 采集只保留需要的方法）。
 
-    签名：xhshow 纯算法（来自 MediaCrawler playwright_sign.py）
-    端点：edith.xiaohongshu.com（来自 MediaCrawler client.py）
+    签名：xhshow（MIT）。端点：edith.xiaohongshu.com。
     """
 
     def __init__(self, headers: Dict[str, str], cookie_dict: Dict[str, str]):
@@ -227,7 +246,7 @@ class XHSClient:
         self._client = httpx.AsyncClient(timeout=30.0)
 
     def _sign_headers(self, uri: str, data: Any, method: str) -> Dict[str, str]:
-        """生成签名头（来自 MediaCrawler playwright_sign.py::sign_with_xhshow）"""
+        """生成 xhshow 签名头。"""
         signs = _xhs.sign_with_xhshow(
             uri=uri,
             data=data,
@@ -245,35 +264,38 @@ class XHSClient:
 
     async def _request(self, method: str, uri: str,
                        params: Optional[Dict] = None,
-                       payload: Optional[Dict] = None) -> Dict:
-        """统一请求（含签名+重试），来自 MediaCrawler client.py::request"""
-        from tenacity import (retry, retry_if_not_exception_type,
-                              stop_after_attempt, wait_fixed)
+                       payload: Optional[Dict] = None,
+                       on_detail: bool = False) -> Dict:
+        """签名请求。详情接口上的 404 / code=-3 记为删除，不按采集失败重试。"""
         url = _DOMAIN + uri
         for attempt in range(3):
             try:
                 if params is not None:
                     headers = self._sign_headers(uri, params, "GET")
-                    # GET 参数逗号不编码（来自 direct_api.py 签名铁律）
                     from urllib.parse import urlencode
                     qs = urlencode(params, doseq=True).replace("%2C", ",")
                     resp = await self._client.get(f"{url}?{qs}", headers=headers)
                 else:
                     headers = self._sign_headers(uri, payload or {}, "POST")
-                    # POST 用紧凑 JSON（来自 direct_api.py 签名铁律）
                     body = json.dumps(payload or {}, separators=(",", ":"),
                                       ensure_ascii=False)
                     resp = await self._client.post(url, content=body, headers=headers)
+                http_kind = classify_http_status(resp.status_code, on_detail)
+                if http_kind:
+                    _raise_xhs_kind(*http_kind)
                 data = resp.json()
                 if data.get("code") != 0:
-                    code = data.get("code")
-                    msg = data.get("msg", "")
-                    if code in (-101, 300012):
-                        raise _xhs.PlatformAccessError(f"登录失效 ({code}): {msg}")
-                    raise _xhs.DataFetchError(f"API 错误 ({code}): {msg}")
+                    kind, human = classify_biz_code(data.get("code"), data.get("msg", ""))
+                    if kind == "deleted" and not on_detail:
+                        kind = "fetch"
+                    _raise_xhs_kind(kind, human)
                 return data.get("data") or {}
-            except (_xhs.PlatformAccessError, _xhs.IPBlockError):
+            except (_xhs.PlatformAccessError, _xhs.IPBlockError, _xhs.NoteNotFoundError):
                 raise
+            except _xhs.DataFetchError:
+                if attempt == 2:
+                    raise
+                await asyncio.sleep(1)
             except Exception as e:
                 if attempt == 2:
                     raise _xhs.DataFetchError(str(e))
@@ -282,7 +304,7 @@ class XHSClient:
 
     async def search_notes(self, keyword: str, search_id: str,
                            page: int = 1, page_size: int = 20) -> Dict:
-        """关键词搜索（来自 MediaCrawler client.py::get_note_by_keyword）"""
+        """关键词搜索。"""
         return await self._request("POST", "/api/sns/web/v1/search/notes", payload={
             "keyword": keyword, "page": page, "page_size": page_size,
             "search_id": search_id,
@@ -292,7 +314,7 @@ class XHSClient:
 
     async def get_note_detail(self, post_id: str, xsec_source: str,
                               xsec_token: str) -> Dict:
-        """笔记详情（来自 MediaCrawler client.py::get_note_by_id）"""
+        """笔记详情。404 / 已删除由调用方单独标记，不当成整次采集失败。"""
         data = {
             "source_note_id": post_id,
             "image_formats": ["jpg", "webp", "avif"],
@@ -300,7 +322,7 @@ class XHSClient:
             "xsec_source": xsec_source or "pc_search",
             "xsec_token": xsec_token,
         }
-        res = await self._request("POST", "/api/sns/web/v1/feed", payload=data)
+        res = await self._request("POST", "/api/sns/web/v1/feed", payload=data, on_detail=True)
         items = res.get("items") or []
         if items:
             return items[0].get("note_card") or {}
@@ -308,7 +330,7 @@ class XHSClient:
 
     async def get_comments(self, post_id: str, xsec_token: str,
                            cursor: str = "") -> Dict:
-        """一级评论（来自 MediaCrawler client.py::get_note_comments）"""
+        """一级评论。"""
         return await self._request("GET", "/api/sns/web/v2/comment/page", params={
             "post_id": post_id, "cursor": cursor, "top_comment_id": "",
             "image_formats": "jpg,webp,avif", "xsec_token": xsec_token,
@@ -316,7 +338,7 @@ class XHSClient:
 
     async def get_sub_comments(self, post_id: str, root_comment_id: str,
                                xsec_token: str, num: int = 10) -> Dict:
-        """二级评论（来自 MediaCrawler client.py::get_note_sub_comments）"""
+        """二级评论。"""
         return await self._request("GET", "/api/sns/web/v2/comment/sub/page", params={
             "post_id": post_id, "root_comment_id": root_comment_id,
             "num": str(num), "cursor": "",
@@ -345,6 +367,7 @@ def _map_note(card: Dict, post_id: str, xsec_token: str,
     tags = [t.get("name", "") for t in (card.get("tag_list") or [])
             if isinstance(t, dict) and t.get("name")]
     ntype = str(card.get("type") or "")
+    share_count, share_ok, share_meta = share_count_meta(inter)
     return NoteData(
         post_id=str(card.get("post_id") or post_id),
         title=str(card.get("title") or ""),
@@ -358,8 +381,36 @@ def _map_note(card: Dict, post_id: str, xsec_token: str,
         liked_count=_to_int(inter.get("liked_count")),
         collected_count=_to_int(inter.get("collected_count")),
         comment_count=_to_int(inter.get("comment_count")),
-        share_count=_to_int(inter.get("share_count")),
+        share_count=share_count,
+        share_count_available=share_ok,
+        field_meta=share_meta,
+        post_status="active",
         media_type="video" if ntype == "video" else "image",
+        note_url=(f"https://www.xiaohongshu.com/explore/{post_id}"
+                  f"?xsec_token={xsec_token}&xsec_source={xsec_source}"),
+        source_keyword=keyword,
+    )
+
+
+def _deleted_note(post_id: str, xsec_token: str, xsec_source: str,
+                  keyword: str, reason: str) -> NoteData:
+    """已删除 / 404：保留一条记录，避免和采集失败混在一起。"""
+    return NoteData(
+        post_id=post_id,
+        title="（已删除或不可浏览）",
+        desc=reason,
+        publish_time=None,
+        share_count=0,
+        share_count_available=False,
+        field_meta={
+            "availability": {"status": "deleted", "reason": reason},
+            "share_count": {
+                "available": False,
+                "source": "not_on_web",
+                "reason": "笔记已删除，网页端无分享数",
+            },
+        },
+        post_status="deleted",
         note_url=(f"https://www.xiaohongshu.com/explore/{post_id}"
                   f"?xsec_token={xsec_token}&xsec_source={xsec_source}"),
         source_keyword=keyword,
@@ -403,10 +454,21 @@ class CortechCrawler:
     supports_author_info = True
 
     def check_login(self) -> Tuple[bool, str]:
-        cache = login_cache_dir()
-        if not cache.exists() or not any(cache.iterdir()):
-            return False, "尚未扫码登录：请在「账号管理」页添加账号并扫码登录"
-        return True, "登录缓存存在，可直接采集"
+        cache = active_login_cache_dir()
+        state = cache / "storage_state.json"
+        if state.is_file():
+            try:
+                _, cookies = cookies_from_state_dict(
+                    json.loads(state.read_text(encoding="utf-8")))
+            except Exception:
+                cookies = {}
+            if cookies.get("a1") and cookies.get("web_session"):
+                return True, "登录缓存里已有 a1 与 web_session，可以采集"
+            return False, ("登录缓存不完整（缺少 a1 或 web_session）。"
+                           "请在「账号管理」用本人账号重新扫码。")
+        if cache.exists() and any(cache.iterdir()):
+            return True, "检测到浏览器登录目录。若采集提示登录失效，请重新扫码。"
+        return False, "尚未扫码登录：请在「账号管理」用本人小红书账号扫码"
 
     def crawl(self, ctx: CrawlContext) -> CrawlResult:
         """同步入口（驱动层调用）"""
@@ -444,6 +506,8 @@ class CortechCrawler:
 
         notes: List[NoteData] = []
         comments: List[CommentData] = []
+        self._deleted = 0
+        self._detail_skipped = 0
         try:
             async def _run():
                 total_kw = len(ctx.keywords)
@@ -465,7 +529,14 @@ class CortechCrawler:
             ctx.log(f"[cortech] 超时（>{ctx.timeout_sec}s），返回已采集部分")
         finally:
             await client.close()
-        return CrawlResult(notes=notes[:ctx.max_notes], comments=comments)
+        result = CrawlResult(notes=notes[:ctx.max_notes], comments=comments)
+        result.deleted_count = getattr(self, "_deleted", 0)
+        result.detail_skipped = getattr(self, "_detail_skipped", 0)
+        if result.deleted_count:
+            ctx.log(f"[cortech] 已标记删除/不可浏览 {result.deleted_count} 条（不算采集失败）")
+        if result.detail_skipped:
+            ctx.log(f"[cortech] 详情采集失败并跳过 {result.detail_skipped} 条（不是删除）")
+        return result
 
     async def _crawl_keyword(self, client: XHSClient, ctx: CrawlContext,
                              keyword: str, notes: List[NoteData],
@@ -514,10 +585,19 @@ class CortechCrawler:
             card = await client.get_note_detail(post_id, xsec_source, xsec_token)
         except (_xhs.PlatformAccessError, _xhs.IPBlockError):
             raise
-        except (_xhs.DataFetchError, _xhs.NoteNotFoundError):
+        except _xhs.NoteNotFoundError as e:
+            self._deleted = getattr(self, "_deleted", 0) + 1
+            ctx.log(f"[cortech] 已删除或不存在 {post_id}：{e}")
+            return _deleted_note(post_id, xsec_token, xsec_source, keyword, str(e))
+        except _xhs.DataFetchError as e:
+            self._detail_skipped = getattr(self, "_detail_skipped", 0) + 1
+            ctx.log(f"[cortech] 详情采集失败（不是删除） {post_id}：{e}")
             return None
         if not card:
-            return None
+            self._deleted = getattr(self, "_deleted", 0) + 1
+            reason = "详情为空，按已删除或不可浏览处理（HTTP/业务 404 一类）"
+            ctx.log(f"[cortech] {reason} {post_id}")
+            return _deleted_note(post_id, xsec_token, xsec_source, keyword, reason)
         await asyncio.sleep(interval)
         note = _map_note(card, post_id, xsec_token, xsec_source, keyword)
         # 作者信息补采（来自 spider_xhs.py 的思路）
@@ -584,10 +664,9 @@ class CortechCrawler:
             ctx.log(f"[cortech] 评论跳过 {note.post_id}：{e}")
 
     async def crawl_browser_fallback(self, ctx: CrawlContext) -> CrawlResult:
-        """浏览器降级模式（来自 mediacrawler.py 的策略）
+        """浏览器降级：direct-API 被封或签名失效时，用 Playwright 打开搜索页。
 
-        direct-API 被封/签名失效时，用 Playwright 打开小红书搜索页直接抓取。
-        需要用户已扫码登录（复用同一登录缓存）。
+        只复用用户已经扫码保存的登录缓存，不另开登录。
         """
         ctx.log("[cortech] 进入浏览器降级模式（Playwright）")
         try:
@@ -601,7 +680,7 @@ class CortechCrawler:
                 headless=True,
                 args=["--no-sandbox", "--disable-blink-features=AutomationControlled"])
             try:
-                cache = login_cache_dir()
+                cache = active_login_cache_dir()
                 state_file = cache / "storage_state.json"
                 if state_file.exists():
                     context = await browser.new_context(

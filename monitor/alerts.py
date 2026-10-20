@@ -73,7 +73,7 @@ CREATE TABLE IF NOT EXISTS alerts (
     topic_id INTEGER,
     topic_name TEXT DEFAULT '',
     task_id INTEGER,
-    note_ids_json TEXT DEFAULT '[]',
+    post_ids_json TEXT DEFAULT '[]',
     link TEXT DEFAULT '',
     status TEXT NOT NULL DEFAULT 'unread',
     created_at INTEGER NOT NULL,
@@ -162,6 +162,7 @@ def init_db() -> None:
     ensure_dirs()
     with _lock, _connect() as conn:
         conn.executescript(SCHEMA)
+        _migrate_post_ids(conn)
         for _t in ("alert_rules", "alerts", "alert_push_log"):
             _cols = [r["name"] for r in conn.execute(f"PRAGMA table_info({_t})").fetchall()]
             if "user_id" not in _cols:
@@ -177,6 +178,28 @@ def init_db() -> None:
                      json.dumps(r["params"], ensure_ascii=False), now, now),
                 )
     logger.info("alerts 表初始化完成")
+
+
+def _migrate_post_ids(conn: sqlite3.Connection) -> None:
+    """历史列 note_ids_json 统一为 post_ids_json，与 notes.post_id 一致。"""
+    try:
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(alerts)").fetchall()}
+    except Exception:
+        return
+    if not cols:
+        return
+    if "post_ids_json" not in cols and "note_ids_json" in cols:
+        conn.execute("ALTER TABLE alerts RENAME COLUMN note_ids_json TO post_ids_json")
+        return
+    if "post_ids_json" not in cols:
+        conn.execute("ALTER TABLE alerts ADD COLUMN post_ids_json TEXT DEFAULT '[]'")
+        cols.add("post_ids_json")
+    if "note_ids_json" in cols and "post_ids_json" in cols:
+        conn.execute(
+            "UPDATE alerts SET post_ids_json=note_ids_json"
+            " WHERE (post_ids_json IS NULL OR post_ids_json='' OR post_ids_json='[]')"
+            " AND note_ids_json IS NOT NULL AND note_ids_json NOT IN ('', '[]')"
+        )
 
 
 # ---------------- 推送配置 ----------------
@@ -327,10 +350,15 @@ def set_rule_enabled(rule_id: int, enabled: bool) -> bool:
 
 def _row_to_alert(row: sqlite3.Row) -> Dict[str, Any]:
     d = dict(row)
+    raw = d.pop("post_ids_json", None)
+    if raw is None:
+        raw = d.pop("note_ids_json", "[]")
+    else:
+        d.pop("note_ids_json", None)
     try:
-        d["note_ids"] = json.loads(d.pop("note_ids_json") or "[]")
+        d["post_ids"] = json.loads(raw or "[]")
     except Exception:
-        d["note_ids"] = []
+        d["post_ids"] = []
     d["level_name"] = LEVELS.get(d["level"], (d["level"], 0))[0]
     return d
 
@@ -368,15 +396,15 @@ def get_alert(alert_id: int) -> Optional[Dict[str, Any]]:
         if not row:
             return None
         alert = _row_to_alert(row)
-        note_ids = alert.get("note_ids") or []
+        post_ids = alert.get("post_ids") or []
         notes = []
-        if note_ids:
-            ph = ",".join("?" for _ in note_ids)
+        if post_ids:
+            ph = ",".join("?" for _ in post_ids)
             nrows = conn.execute(
                 f"SELECT post_id,title,author,liked_count,collected_count,"
-                f"comment_count,share_count,sentiment,note_url,publish_time"
+                f"comment_count,share_count,sentiment,note_url,publish_time,post_status"
                 f" FROM notes WHERE post_id IN ({ph})",
-                note_ids,
+                post_ids,
             ).fetchall()
             notes = [dict(n) for n in nrows]
         alert["notes"] = notes
@@ -415,14 +443,14 @@ def unread_count() -> int:
 def _create_alert(conn: sqlite3.Connection, rule: Dict[str, Any], level: str,
                   title: str, summary: str, topic_id: Optional[int],
                   topic_name: str, task_id: Optional[int],
-                  note_ids: List[str], link: str) -> int:
+                  post_ids: List[str], link: str) -> int:
     now = int(time.time())
     cur = conn.execute(
         "INSERT INTO alerts(user_id,rule_id,rule_name,level,title,summary,topic_id,"
-        "topic_name,task_id,note_ids_json,link,status,created_at,updated_at)"
+        "topic_name,task_id,post_ids_json,link,status,created_at,updated_at)"
         " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (rule.get("user_id"), rule["id"], rule["name"], level, title, summary, topic_id, topic_name,
-         task_id, json.dumps(note_ids, ensure_ascii=False), link,
+         task_id, json.dumps(post_ids, ensure_ascii=False), link,
          "unread", now, now),
     )
     return cur.lastrowid
@@ -438,7 +466,7 @@ def create_alert(level: str, title: str, message: str,
         # 系统规则占位（rule_id=0）
         cur = conn.execute(
             "INSERT INTO alerts(rule_id,rule_name,level,title,summary,topic_id,"
-            "topic_name,task_id,note_ids_json,link,status,created_at,updated_at)"
+            "topic_name,task_id,post_ids_json,link,status,created_at,updated_at)"
             " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (0, "系统", level, title, message, topic_id, "",
              None, "[]", "", "unread", now, now))
@@ -689,13 +717,13 @@ def evaluate_after_task(task_id: int) -> List[Dict[str, Any]]:
                 continue
             if not hit:
                 continue
-            level, title, summary, note_ids, link = hit
+            level, title, summary, post_ids, link = hit
             aid = _create_alert(conn, rule, level, title, summary, topic_id,
-                                topic_name, task_id, note_ids, link)
+                                topic_name, task_id, post_ids, link)
             alert = {"id": aid, "rule_id": rule["id"], "rule_name": rule["name"],
                      "level": level, "title": title, "summary": summary,
                      "topic_id": topic_id, "topic_name": topic_name,
-                     "task_id": task_id, "note_ids": note_ids, "link": link,
+                     "task_id": task_id, "post_ids": post_ids, "link": link,
                      "status": "unread"}
             created.append(alert)
             logger.info("生成预警 [%s] %s", level, title)

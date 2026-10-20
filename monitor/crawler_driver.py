@@ -16,8 +16,10 @@ from typing import Optional
 from . import db
 from . import cortech_crawler
 from .cortech_crawler import CrawlContext, CortechCrawlerFailed
+from .adapters.base import AdapterNotSupported
 from .config import (DEFAULT_MAX_COMMENTS_PER_NOTE, DEFAULT_TIMEOUT_SEC,
-                     RUNS_DIR)
+                     RUNS_DIR, collection_fixture_enabled)
+from .xhs_errors import failure_kind_from_message
 
 
 class _Cancelled(Exception):
@@ -42,17 +44,26 @@ def trigger_crawl(topic_id: int, engine: Optional[str] = None,
     topic = db.get_topic(topic_id)
     if not topic:
         raise ValueError(f"话题不存在: {topic_id}")
-    eng = "cortech_crawler"  # 统一采集器（融合4引擎）
-    crawler = cortech_crawler.get_crawler()
-    if account_id is None:
-        default_acc = db.get_default_account()
-        account_id = default_acc["id"] if default_acc else None
+    eng = "cortech_crawler"  # 统一采集器
+    cortech_crawler.get_crawler()
+    auto_rotate = account_id is None and not collection_fixture_enabled()
+    if collection_fixture_enabled():
+        account_id = None
+    elif account_id is None:
+        picked = db.next_collection_account()
+        account_id = picked["id"] if picked else None
+        if account_id is None:
+            raise ValueError(
+                "需要真实小红书登录态：请先在「账号管理」用本人账号扫码登录后再采集。"
+                "服务端不能代替扫码。（need_xhs_session）"
+            )
     if account_id:
         acc = db.get_account(account_id)
         if not acc or acc["status"] != "valid":
             raise ValueError(
                 f"账号「{acc['nickname'] if acc else account_id}」登录失效，"
-                "请在「账号管理」重新扫码后再采集")
+                "请在「账号管理」重新扫码后再采集。（need_xhs_rescan）"
+            )
         db.update_account(account_id, {"last_used_at": int(time.time())})
     task_id = db.create_task(topic_id, eng, account_id=account_id,
                              aggressive=1 if aggressive else 0)
@@ -62,7 +73,7 @@ def trigger_crawl(topic_id: int, engine: Optional[str] = None,
     t = threading.Thread(
         target=_run_task,
         args=(task_id, topic, eng, max_notes, enable_comments, timeout_sec,
-              account_id, aggressive, uid),
+              account_id, aggressive, uid, auto_rotate),
         daemon=True,
     )
     t.start()
@@ -91,19 +102,35 @@ def _append_log(task_id: int, log_file: Path, line: str) -> None:
 def _run_task(task_id: int, topic: dict, engine: str, max_notes: Optional[int],
               enable_comments: Optional[bool], timeout_sec: int,
               account_id: Optional[int] = None, aggressive: bool = False,
-              uid: Optional[int] = None) -> None:
+              uid: Optional[int] = None, auto_rotate: bool = False) -> None:
     # ContextVar 不跨线程：入口处设置本任务的用户上下文
     db.set_current_user(uid)
     try:
         _run_task_inner(task_id, topic, engine, max_notes, enable_comments,
-                        timeout_sec, account_id, aggressive)
+                        timeout_sec, account_id, aggressive, auto_rotate)
     finally:
         db.set_current_user(None)
 
 
+def _candidate_accounts(account_id: Optional[int], auto_rotate: bool) -> list:
+    """自动轮询时最多再换一个有效账号；指定账号则不擅自换号。"""
+    if collection_fixture_enabled():
+        return [None]
+    if not auto_rotate:
+        return [account_id]
+    ordered = [a["id"] for a in db.list_valid_accounts_lru()]
+    if account_id in ordered:
+        ordered.remove(account_id)
+        ordered.insert(0, account_id)
+    elif account_id:
+        ordered.insert(0, account_id)
+    return ordered[:2] or [account_id]
+
+
 def _run_task_inner(task_id: int, topic: dict, engine: str, max_notes: Optional[int],
                     enable_comments: Optional[bool], timeout_sec: int,
-                    account_id: Optional[int] = None, aggressive: bool = False) -> None:
+                    account_id: Optional[int] = None, aggressive: bool = False,
+                    auto_rotate: bool = False) -> None:
     if not _run_lock.acquire(blocking=False):
         db.update_task(task_id, status="failed", finished_at=int(time.time()),
                         error="已有采集任务在运行，请等待其完成后再试")
@@ -128,48 +155,81 @@ def _run_task_inner(task_id: int, topic: dict, engine: str, max_notes: Optional[
         t = db.get_task(task_id)
         return bool(t and t.get("cancel_requested"))
 
+    engine_used = "cortech_crawler"
     try:
         db.update_task(task_id, status="running", started_at=int(time.time()),
                         progress=2, progress_detail="任务启动中…")
-        engine_used = "cortech_crawler"
         crawler = cortech_crawler.get_crawler()
-        acc_name = ""
-        if account_id:
-            acc = db.get_account(account_id)
-            acc_name = acc["nickname"] if acc else ""
-        _log(f"[driver] 引擎=Cortech统一采集器（{crawler.title}）话题={topic['name']}"
-             f"{' 账号=' + acc_name if acc_name else ''}"
-             f"{' [强攻模式]' if aggressive else ''}")
-        ok, hint = crawler.check_login()
-        _log(f"[driver] 登录态检查：{'通过' if ok else '未通过'} - {hint}")
-        if not ok:
-            raise RuntimeError(f"引擎 {engine} 未就绪：{hint}")
-        if _should_stop():
-            raise _Cancelled()
-
         keywords = [k.strip() for k in topic["keywords"].split(",") if k.strip()]
-        ctx = CrawlContext(
-            topic_id=topic["id"], topic_name=topic["name"],
-            keywords=keywords,
-            max_notes=max_notes or topic["max_notes"] or 50,
-            enable_comments=(enable_comments if enable_comments is not None
-                             else bool(topic["enable_comments"])),
-            max_comments_per_note=DEFAULT_MAX_COMMENTS_PER_NOTE,
-            run_dir=run_dir, task_id=task_id,
-            timeout_sec=timeout_sec, log=_log,
-            aggressive=aggressive, account_id=account_id, account_name=acc_name,
-            report_progress=_report_progress, should_stop=_should_stop,
-        )
+        candidates = _candidate_accounts(account_id, auto_rotate)
         result = None
-        try:
-            result = crawler.crawl(ctx)
-        except CortechCrawlerFailed as e:
-            # 统一采集器内部已处理降级，这里直接抛错
-            raise RuntimeError(f"采集失败：{e}") from e
+        last_error = "采集失败"
+        for idx, acc_id in enumerate(candidates):
+            acc_name = ""
+            if acc_id:
+                acc = db.get_account(acc_id) or {}
+                acc_name = acc.get("nickname") or ""
+                db.update_account(acc_id, {"last_used_at": int(time.time())})
+            _log(f"[driver] 引擎=Cortech统一采集器（{crawler.title}）话题={topic['name']}"
+                 f"{' 账号=' + acc_name if acc_name else ''}"
+                 f"{' [强攻模式]' if aggressive else ''}"
+                 f"{' [本地样例]' if collection_fixture_enabled() else ''}")
+            if collection_fixture_enabled():
+                ok, hint = True, "本地样例模式，不访问小红书，也不能代替真实扫码登录"
+            elif acc_id:
+                ok, hint = True, f"使用账号「{acc_name or acc_id}」已保存的登录态"
+            else:
+                ok, hint = crawler.check_login()
+            _log(f"[driver] 登录态检查：{'通过' if ok else '未通过'} - {hint}")
+            if not ok:
+                raise RuntimeError(
+                    "需要真实小红书登录态：请在「账号管理」用本人账号扫码后再采集。"
+                    f"（{hint}）"
+                )
+            if _should_stop():
+                raise _Cancelled()
+            ctx = CrawlContext(
+                topic_id=topic["id"], topic_name=topic["name"],
+                keywords=keywords,
+                max_notes=max_notes or topic["max_notes"] or 50,
+                enable_comments=(enable_comments if enable_comments is not None
+                                 else bool(topic["enable_comments"])),
+                max_comments_per_note=DEFAULT_MAX_COMMENTS_PER_NOTE,
+                run_dir=run_dir, task_id=task_id,
+                timeout_sec=timeout_sec, log=_log,
+                aggressive=aggressive, account_id=acc_id, account_name=acc_name,
+                report_progress=_report_progress, should_stop=_should_stop,
+            )
+            try:
+                if collection_fixture_enabled():
+                    from .collection_fixture import build_result
+                    result = build_result(keywords[0] if keywords else topic["name"])
+                    _log("[driver] 已生成本地样例笔记，未请求小红书")
+                    break
+                result = crawler.crawl(ctx)
+                break
+            except CortechCrawlerFailed as e:
+                human = str(e)
+                last_error = human if human.startswith("采集") else f"采集失败：{human}"
+                kind = failure_kind_from_message(human)
+                if kind == "login" and acc_id:
+                    db.update_account(acc_id, {
+                        "status": "expired",
+                        "last_check_at": int(time.time()),
+                        "check_note": human[:180],
+                    })
+                    _log(f"[driver] 账号「{acc_name or acc_id}」登录失效，已标为过期。{human}")
+                    if auto_rotate and idx == 0 and idx + 1 < len(candidates):
+                        _log("[driver] 轮询到下一个已登录账号，再试一次")
+                        continue
+                raise RuntimeError(last_error) from e
+        if result is None:
+            raise RuntimeError(last_error)
         if _should_stop():
             raise _Cancelled()
         _report_progress(96, "正在入库…")
         _log(f"[driver] 采集返回：帖子 {len(result.notes)} 条，评论 {len(result.comments)} 条"
+             f"，删除 {getattr(result, 'deleted_count', 0)} 条"
              f"（实际引擎：{engine_used}），开始入库")
 
         from .ingester import store_unified

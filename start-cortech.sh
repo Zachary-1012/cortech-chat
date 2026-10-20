@@ -5,8 +5,11 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 PY="${PYTHON:-python3}"
-HOST="${XHS_HOST:-127.0.0.1}"
-PORT="${XHS_PORT:-8000}"
+# 本地脚本默认只听本机。云上请直接用 README 里的 CORTECH_HOST=0.0.0.0，不要走这个脚本。
+export CORTECH_HOST="${CORTECH_HOST:-${XHS_HOST:-127.0.0.1}}"
+export CORTECH_PORT="${CORTECH_PORT:-${XHS_PORT:-8000}}"
+HOST="$CORTECH_HOST"
+PORT="$CORTECH_PORT"
 
 # 优先使用随包分发的离线依赖 libs/（存在则注入 PYTHONPATH）
 if [ -d libs ]; then

@@ -9,17 +9,91 @@ from pathlib import Path
 # （禁止硬编码开发机路径）
 BASE_DIR = Path(__file__).resolve().parent.parent
 
-# Cortech采集引擎 引擎（vendor 下代码禁止修改）
+# Cortech 采集引擎目录（历史 vendor 路径，登录缓存不再依赖它）
 CORTECH_VENDOR_DIR = BASE_DIR / "vendor" / "Cortech采集引擎"
-
-# 数据目录（SQLite 库 / 采集运行目录）
-DATA_DIR = BASE_DIR / "data"
-RUNS_DIR = DATA_DIR / "runs"
-DB_PATH = DATA_DIR / "monitor.db"
 
 MONITOR_DIR = BASE_DIR / "monitor"
 STATIC_DIR = MONITOR_DIR / "static"
 NEGATIVE_WORDS_FILE = MONITOR_DIR / "negative_words.txt"
+
+
+def _load_dotenv() -> None:
+    """加载 monitor/.env（KEY=VALUE，每行一个；已存在的环境变量不覆盖）。
+
+    本地密钥文件，gitignored。绝不在日志/接口/文档中输出其内容。
+    """
+    env_file = MONITOR_DIR / ".env"
+    if not env_file.exists():
+        return
+    try:
+        for line in env_file.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, _, v = line.partition("=")
+            k, v = k.strip(), v.strip().strip("'").strip('"')
+            if k and v and k not in os.environ:
+                os.environ[k] = v
+    except Exception:
+        pass  # .env 缺失/损坏不影响启动
+
+
+_load_dotenv()
+
+
+def resolve_data_dir() -> Path:
+    """数据目录：CORTECH_DATA_DIR，其次历史别名 TKH_DATA_DIR，否则 <项目>/data。
+
+    生产环境应把库、登录缓存和密钥放到程序目录之外。
+    """
+    raw = (os.environ.get("CORTECH_DATA_DIR") or os.environ.get("TKH_DATA_DIR") or "").strip()
+    if raw:
+        return Path(raw).expanduser()
+    return BASE_DIR / "data"
+
+
+# 数据目录（SQLite / 采集运行目录 / 登录缓存 / 本地密钥）
+DATA_DIR = resolve_data_dir()
+RUNS_DIR = DATA_DIR / "runs"
+DB_PATH = DATA_DIR / "monitor.db"
+
+
+def bind_host() -> str:
+    """监听地址。CORTECH_HOST 优先，其次 XHS_HOST，默认 0.0.0.0（容器 / VPS）。"""
+    return (os.environ.get("CORTECH_HOST") or os.environ.get("XHS_HOST") or "0.0.0.0").strip() or "0.0.0.0"
+
+
+def bind_port() -> int:
+    """监听端口。CORTECH_PORT 优先，其次 XHS_PORT，默认 8000。"""
+    raw = (os.environ.get("CORTECH_PORT") or os.environ.get("XHS_PORT") or "8000").strip()
+    try:
+        port = int(raw)
+    except ValueError:
+        return 8000
+    if port < 1 or port > 65535:
+        return 8000
+    return port
+
+
+def collection_fixture_enabled() -> bool:
+    """为真时采集走本地样例，不访问小红书。仅用于闭环自检。"""
+    return (os.environ.get("CORTECH_COLLECTION_FIXTURE") or "").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+
+
+def cookie_handshake_enabled() -> bool:
+    """用户主动提交本人 Cookie 的握手。默认关闭。"""
+    return (os.environ.get("CORTECH_ENABLE_COOKIE_HANDSHAKE") or "").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+
+
+def browser_use_enabled() -> bool:
+    """用户指定本机已登录 profile 的可选钩子。默认关闭，不代登录。"""
+    return (os.environ.get("CORTECH_ENABLE_BROWSER_USE") or "").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
 
 # 默认采集参数
 DEFAULT_MAX_NOTES = 50                 # 每个关键词最多采集帖子数
@@ -64,35 +138,35 @@ def ensure_dirs() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     RUNS_DIR.mkdir(parents=True, exist_ok=True)
     STATIC_DIR.mkdir(parents=True, exist_ok=True)
+    login_cache_dir().mkdir(parents=True, exist_ok=True)
 
 
-def _load_dotenv() -> None:
-    """加载 monitor/.env（KEY=VALUE，每行一个；已存在的环境变量不覆盖）。
-
-    本地密钥文件，gitignored。绝不在日志/接口/文档中输出其内容。
-    """
-    env_file = MONITOR_DIR / ".env"
-    if not env_file.exists():
-        return
+def _dir_has_entries(path: Path) -> bool:
     try:
-        for line in env_file.read_text(encoding="utf-8").splitlines():
-            line = line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            k, _, v = line.partition("=")
-            k, v = k.strip(), v.strip().strip("'").strip('"')
-            if k and v and k not in os.environ:
-                os.environ[k] = v
-    except Exception:
-        pass  # .env 缺失/损坏不影响启动
-
-
-_load_dotenv()
+        return path.exists() and any(path.iterdir())
+    except OSError:
+        return False
 
 
 def login_cache_dir() -> Path:
-    """Cortech采集引擎 小红书登录态浏览器缓存目录（--lt qrcode 扫码后写入）"""
+    """可写的小红书登录缓存，放在数据目录下，不要求位于程序目录。"""
+    return DATA_DIR / "xhs_login_cache"
+
+
+def legacy_login_cache_dir() -> Path:
+    """历史登录缓存位置。只作为读取回退，新登录不再写到这里。"""
     return CORTECH_VENDOR_DIR / "xhs_user_data_dir"
+
+
+def active_login_cache_dir() -> Path:
+    """读取登录缓存：优先数据目录，其次历史 vendor 目录。"""
+    primary = login_cache_dir()
+    if _dir_has_entries(primary):
+        return primary
+    legacy = legacy_login_cache_dir()
+    if _dir_has_entries(legacy):
+        return legacy
+    return primary
 
 
 # ---------------- AI 配置（多 Provider，OpenAI 兼容协议） ----------------

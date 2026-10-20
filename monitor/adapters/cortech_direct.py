@@ -14,20 +14,9 @@ v2 关键纠正（已落实）：
 - 漂移检测：monitor/sign_drift.py（L1 被动/L2 探针/L3 bundle/L4 xhshow），
   告警接入分级预警，签名红灯自动降级浏览器引擎。
 
-实现策略（按任务要求：复用 vendor 现有实现，不重写签名算法）：
-- 签名：直接复用 vendor/MediaCrawler/media_platform/xhs/playwright_sign.py 的
-  `sign_with_xhshow()`（纯函数，无需浏览器；xhshow 为 MIT 开源库）。
-- 请求：直接复用 vendor 的 `XiaoHongShuClient`（media_platform/xhs/client.py），
-  其 `playwright_page` 在 request 流程中仅存储未使用（源码实证：
-  client.py 全文仅第 84 行赋值一处；vendor 自有测试 test_xhs_raw_response_errors.py
-  即以 playwright_page=object() 构造使用）。
-- 登录态：复用 MediaCrawler 的扫码登录缓存（vendor/MediaCrawler/xhs_user_data_dir），
-  以 headless 方式读取一次 Cookie（a1 + web_session），全程无可见浏览器。
-- 流程：关键词搜索（翻页）→ 笔记详情 → 一级评论（翻页）→ 二级评论（限量）
-  → 统一数据模型（NoteData/CommentData），入库走同一链路。
-
-风控：请求间隔、分页上限、失败重试与指数退避；签名失效/账号风控时抛
-DirectAPIFailed，由驱动层自动降级到 MediaCrawler 浏览器引擎。
+实现策略：签名使用 xhshow（MIT）；登录态读取数据目录里本人扫码保存的
+a1 + web_session；流程为关键词搜索、笔记详情、评论。签名失效或账号风控时抛
+DirectAPIFailed，由驱动层降级到浏览器引擎。
 """
 from __future__ import annotations
 
@@ -38,7 +27,8 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from ..config import BASE_DIR, login_cache_dir
+from ..config import BASE_DIR, active_login_cache_dir
+from ..xhs_errors import share_count_meta
 from . import register
 from .base import (AuthorData, CommentData, CrawlContext, CrawlResult,
                    CrawlerAdapter, NoteData)
@@ -75,14 +65,14 @@ def _import_vendor():
         from tools.crawler_util import convert_cookies
     except ImportError as e:
         raise RuntimeError(
-            "direct-api 依赖未就绪：请先 pip install -r vendor/MediaCrawler/requirements.txt"
+            "direct-api 依赖未就绪：请先安装运行环境依赖（monitor/requirements.txt）"
             f"（缺 {e}）。注意 xhshow/playwright 来自该 requirements。")
     return XiaoHongShuClient, convert_cookies, (DataFetchError, IPBlockError,
                                                 NoteNotFoundError, PlatformAccessError)
 
 
 async def _read_login_cookies(profile_dir=None) -> Tuple[str, Dict[str, str]]:
-    """headless 读取扫码登录缓存的 Cookie（复用 MediaCrawler 登录态，不重写登录）
+    """读取本人扫码保存的 Cookie（不重新登录）
 
     profile_dir：指定账号的解密 profile 目录（多账号）；None 则用默认登录缓存。
     """
@@ -90,7 +80,7 @@ async def _read_login_cookies(profile_dir=None) -> Tuple[str, Dict[str, str]]:
     try:
         from playwright.async_api import async_playwright
     except ImportError:
-        raise RuntimeError("playwright 未安装：pip install -r vendor/MediaCrawler/requirements.txt")
+        raise RuntimeError("playwright 未安装，无法从浏览器 profile 读取登录态")
     from pathlib import Path
 
     async def _cookies_from_storage(browser, storage_state) -> list:
@@ -109,7 +99,7 @@ async def _read_login_cookies(profile_dir=None) -> Tuple[str, Dict[str, str]]:
                 # 多账号：调用方已解密出 storage_state dict
                 cookies = await _cookies_from_storage(browser, profile_dir)
             else:
-                cache = Path(profile_dir) if profile_dir else login_cache_dir()
+                cache = Path(profile_dir) if profile_dir else active_login_cache_dir()
                 state_file = cache / "storage_state.json"
                 if state_file.exists():
                     cookies = await _cookies_from_storage(
@@ -182,22 +172,21 @@ class DirectAPIAdapter(CrawlerAdapter):
     name = "cortech_direct"
     title = "Cortech直连引擎（默认）"
     description = ("小红书网页版 direct-API 直采（edith.xiaohongshu.com）：轻量快速，"
-                   "无浏览器开销；签名/登录态复用 MediaCrawler 实现；"
-                   "失效时自动降级到浏览器引擎。")
+                   "无浏览器开销；登录失效时降级到浏览器引擎。")
     supports_keyword_search = True
     supports_comments = True
     supports_author_info = True
     needs_browser = False   # 仅 headless 读一次登录 Cookie，不跑可见浏览器
     needs_node = False
-    login_method = ("复用 MediaCrawler 扫码登录缓存：按 README 扫码一次，"
-                    "本引擎 headless 读取 Cookie（a1 + web_session）后直调 API")
+    login_method = ("在「账号管理」用本人小红书账号扫码一次，"
+                    "本引擎读取 Cookie（a1 + web_session）后直调 API")
 
     def check_login(self) -> Tuple[bool, str]:
         try:
             _import_vendor()
         except RuntimeError as e:
             return False, str(e)
-        cache = login_cache_dir()
+        cache = active_login_cache_dir()
         if not cache.exists() or not any(cache.iterdir()):
             return False, "尚未扫码登录：请在「账号管理」页添加账号并扫码登录"
         return True, "登录缓存存在，Cookie 可在采集时 headless 读取"
@@ -325,11 +314,33 @@ class DirectAPIAdapter(CrawlerAdapter):
             card = await client.get_note_by_id(post_id, xsec_source, xsec_token)
         except (PlatformAccessError, IPBlockError):
             raise
-        except (DataFetchError, NoteNotFoundError) as e:
-            ctx.log(f"[direct-api] 详情跳过 {post_id}：{type(e).__name__}")
+        except NoteNotFoundError as e:
+            ctx.log(f"[direct-api] 已删除或不存在 {post_id}：{e}")
+            return NoteData(
+                post_id=post_id,
+                title="（已删除或不可浏览）",
+                desc=str(e),
+                post_status="deleted",
+                share_count_available=False,
+                field_meta={"availability": {"status": "deleted", "reason": str(e)}},
+                note_url=f"https://www.xiaohongshu.com/explore/{post_id}",
+                source_keyword=keyword,
+            )
+        except DataFetchError as e:
+            ctx.log(f"[direct-api] 详情采集失败（不是删除） {post_id}：{e}")
             return None
         if not card:
-            return None
+            ctx.log(f"[direct-api] 详情为空，按已删除处理 {post_id}")
+            return NoteData(
+                post_id=post_id,
+                title="（已删除或不可浏览）",
+                desc="详情为空，按已删除或不可浏览处理",
+                post_status="deleted",
+                share_count_available=False,
+                field_meta={"availability": {"status": "deleted"}},
+                note_url=f"https://www.xiaohongshu.com/explore/{post_id}",
+                source_keyword=keyword,
+            )
         await asyncio.sleep(getattr(self, '_interval', REQUEST_INTERVAL_SEC))
         return self._map_note(card, post_id, xsec_token, xsec_source, keyword)
 
@@ -342,6 +353,7 @@ class DirectAPIAdapter(CrawlerAdapter):
         tags = [t.get("name", "") for t in (card.get("tag_list") or [])
                 if isinstance(t, dict) and t.get("name")]
         ntype = str(card.get("type") or "")
+        _share = share_count_meta(inter)
         return NoteData(
             post_id=str(card.get("post_id") or post_id),
             title=str(card.get("title") or ""),
@@ -355,7 +367,9 @@ class DirectAPIAdapter(CrawlerAdapter):
             liked_count=_to_int(inter.get("liked_count")),
             collected_count=_to_int(inter.get("collected_count")),
             comment_count=_to_int(inter.get("comment_count")),
-            share_count=_to_int(inter.get("share_count")),
+            share_count=_share[0],
+            share_count_available=_share[1],
+            field_meta=_share[2],
             media_type="video" if ntype == "video" else "image",
             note_url=(f"https://www.xiaohongshu.com/explore/{post_id}"
                       f"?xsec_token={xsec_token}&xsec_source={xsec_source}"),

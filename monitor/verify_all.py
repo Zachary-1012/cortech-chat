@@ -66,7 +66,94 @@ def main():
             "interact_info": {"liked_count": "5"}, "time": ms, "tag_list": [{"name": "广州太古汇"}]}
     m = DirectAPIAdapter._map_note(card, "v1", "tok", "pc_search", "kw")
     check("direct-api 映射", m.publish_time_raw == str(ms) and m.tags == ["广州太古汇"])
+    check("分享数缺字段时标记 not_on_web",
+          m.share_count_available is False
+          and (m.field_meta.get("share_count") or {}).get("source") == "not_on_web")
     check("DirectAPIFailed 可捕获", issubclass(DirectAPIFailed, Exception))
+
+    # ---- 4b. SaaS 运行时 / 采集语义 / 样例闭环 ----
+    import os
+    from monitor.config import bind_host, resolve_data_dir
+    from monitor.setup_status import build_setup_status
+    from monitor.xhs_errors import classify_biz_code
+    from monitor.collection_fixture import ingest_fixture
+    from monitor import alerts
+
+    saved_host = os.environ.pop("CORTECH_HOST", None)
+    saved_xhs_host = os.environ.pop("XHS_HOST", None)
+    try:
+        check("默认监听 0.0.0.0", bind_host() == "0.0.0.0")
+    finally:
+        if saved_host is not None:
+            os.environ["CORTECH_HOST"] = saved_host
+        if saved_xhs_host is not None:
+            os.environ["XHS_HOST"] = saved_xhs_host
+    os.environ["CORTECH_DATA_DIR"] = "/tmp/cortech-data-dir-check"
+    check("数据目录读 CORTECH_DATA_DIR", str(resolve_data_dir()) == "/tmp/cortech-data-dir-check")
+    os.environ.pop("CORTECH_DATA_DIR", None)
+    try:
+        import bcrypt  # noqa: F401
+        bcrypt_ok = True
+    except ImportError:
+        bcrypt_ok = False
+    check("bcrypt 可导入", bcrypt_ok)
+    status = build_setup_status(None)
+    ids = {c["id"] for c in status["checks"]}
+    check("setup status 结构",
+          status.get("product") == "Cortech Chat"
+          and {"db", "data_dir", "auth", "xhs_account"} <= ids
+          and status["collection"]["needs_real_xhs_session"] is True)
+    kind, human = classify_biz_code(-3, "")
+    check("code=-3 视为删除", kind == "deleted" and "不计入采集失败" in human)
+    kind_login, _ = classify_biz_code(-101, "")
+    check("code=-101 视为登录失效", kind_login == "login")
+
+    alerts.init_db()
+    with alerts._connect() as conn:
+        alert_cols = {r["name"] for r in conn.execute("PRAGMA table_info(alerts)").fetchall()}
+    check("预警列是 post_ids_json",
+          "post_ids_json" in alert_cols and "note_ids_json" not in alert_cols)
+
+    acc_old = db.create_account("轮询-旧")
+    acc_new = db.create_account("轮询-新")
+    db.update_account(acc_old, {"status": "valid", "last_used_at": 10})
+    db.update_account(acc_new, {"status": "valid", "last_used_at": 50})
+    ordered = [a["id"] for a in db.list_valid_accounts_lru()]
+    check("多账号轮询按最久未用排序",
+          acc_old in ordered and acc_new in ordered
+          and ordered.index(acc_old) < ordered.index(acc_new))
+    db.delete_account(acc_old)
+    db.delete_account(acc_new)
+
+    saved_fixture = os.environ.pop("CORTECH_COLLECTION_FIXTURE", None)
+    try:
+        crawler_mod = __import__("monitor.crawler_driver", fromlist=["trigger_crawl"])
+        crawler_mod.trigger_crawl(tid, account_id=10**9)
+        check("无登录态时拒绝采集", False)
+    except ValueError as e:
+        check("无登录态时拒绝采集", "need_xhs_session" in str(e) or "need_xhs_rescan" in str(e) or "登录" in str(e))
+    finally:
+        if saved_fixture is not None:
+            os.environ["CORTECH_COLLECTION_FIXTURE"] = saved_fixture
+
+    fx = ingest_fixture(tid, "闭环样例")
+    with db._connect() as conn:
+        rows = conn.execute(
+            "SELECT post_id, publish_time, collected_at, post_status, field_meta"
+            " FROM notes WHERE post_id LIKE 'fixture_%'"
+        ).fetchall()
+    live = [r for r in rows if r["post_status"] != "deleted" and r["publish_time"]]
+    deleted = [r for r in rows if r["post_status"] == "deleted"]
+    check("样例采集发布时间不等于采集时间",
+          bool(live) and all(r["publish_time"] != r["collected_at"] for r in live),
+          f"added={fx['notes']}")
+    check("删除笔记单独标记", bool(deleted))
+    with db._connect() as conn:
+        conn.execute("DELETE FROM notes WHERE post_id LIKE 'fixture_%'")
+
+    static_html = ( __import__("pathlib").Path(__file__).resolve().parent / "static" / "index.html").read_text(encoding="utf-8")
+    dist_api = ( __import__("pathlib").Path(__file__).resolve().parent.parent / "frontend" / "dist" / "assets" / "index-VG6IEY1v.js").read_text(encoding="utf-8")
+    check("旧 /api/notes 已改到 /api/posts", "/api/notes" not in static_html and 'url:"/notes"' not in dist_api)
 
     # ---- 5. 趋势/预警/简报/报告 ----
     t = trends.get_trends(tid, 7)

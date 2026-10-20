@@ -1,17 +1,56 @@
-# Chat Cortech
+# Cortech Chat
 
-> 通用社媒舆情运营 SaaS —— 小红书舆情采集 · 多维分析 · 可视化 · 内容创作 · 伪冒反查
+> 小红书高强采集 · 社媒运营 · 整合营销的 Web SaaS
 >
 > 让社媒运营有数可依。
 
-本地优先的单机应用：内置 SQLite、内置示例数据、零外部服务依赖，双击即启动。
-Windows 上以**桌面客户端**（独立应用窗口）方式运行。
+主路径是浏览器里的 Web SaaS：服务跑在云主机或容器上，使用者只打开网页。
+内置 SQLite。本地双击脚本仍可用于演示，不是交付方式。
 
 ---
 
 ## 快速开始
 
-### Windows（推荐：桌面客户端）
+### 云主机 / VPS / 容器（主路径）
+
+在服务器上安装一次依赖，之后用环境变量启动。终端用户不需要在自己的电脑上 `pip install`。
+
+```bash
+python3 -m pip install -r monitor/requirements.txt
+export CORTECH_DATA_DIR=/var/lib/cortech    # 库、登录缓存、密钥；不要放在程序目录里
+export CORTECH_HOST=0.0.0.0
+export CORTECH_PORT=8000
+python3 -m monitor.app
+```
+
+可选的多进程启动（需另装 gunicorn）：
+
+```bash
+gunicorn monitor.app:app -k uvicorn.workers.UvicornWorker -b 0.0.0.0:8000
+```
+
+打开 `http://<服务器>:8000`。首次注册后，到「账号管理」用**本人**小红书账号扫码。没有真实登录态时，采集接口会返回 `need_xhs_session`，不会假装采到了笔记。
+
+自检：
+
+```bash
+curl -s http://127.0.0.1:8000/api/setup/status
+```
+
+返回 JSON，包含数据库、数据目录可写、bcrypt 登录组件、以及当前用户是否已有小红书账号。
+
+| 变量 | 作用 | 默认 |
+|------|------|------|
+| `CORTECH_DATA_DIR` | 数据目录（`TKH_DATA_DIR` 仍可作为别名） | 项目下 `data/` |
+| `CORTECH_HOST` | 监听地址（`XHS_HOST` 为旧名） | `0.0.0.0` |
+| `CORTECH_PORT` | 监听端口（`XHS_PORT` 为旧名） | `8000` |
+| `CORTECH_COLLECTION_FIXTURE` | `1` 时写入本地样例，不访问小红书 | 关 |
+| `CORTECH_ENABLE_COOKIE_HANDSHAKE` | `1` 时允许用户主动提交本人 Cookie | 关 |
+| `CORTECH_ENABLE_BROWSER_USE` | `1` 时只承认你指定的本地 profile，不代登录 | 关 |
+
+域名接入仍可用「设置」里的站点配置生成 nginx 样例。证书和 DNS 需要你在域名服务商处完成。
+
+### Windows（本地演示：桌面窗口）
 
 1. 安装 **Python 3.14**（勾选 *Add Python to PATH*）
    <https://www.python.org/downloads/>
@@ -25,7 +64,7 @@ Windows 上以**桌面客户端**（独立应用窗口）方式运行。
 3. 首次运行会引导**注册账号**（本地版无需邮箱验证码）；首个注册用户自动继承内置示例数据。
 4. 可选：双击 `创建桌面快捷方式.bat`，在桌面生成带图标的 Chat Cortech 快捷方式。
 
-> 若只想用浏览器：`python -m monitor.app` 然后访问 <http://127.0.0.1:8000>
+> 本机直接跑服务：`python -m monitor.app`（默认 `0.0.0.0:8000`），浏览器打开 <http://127.0.0.1:8000>。云上请改用上面的环境变量。
 
 ### Linux / macOS
 

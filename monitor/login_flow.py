@@ -245,6 +245,52 @@ class _LoginManager:
         return {"account_id": account_id, "status": "idle"}
 
 
+def account_health(acc: dict) -> dict:
+    """登录态健康检查。只看已保存的 Cookie 是否齐全，不向小红书发请求。"""
+    account_id = acc.get("id")
+    base = {
+        "ok": False,
+        "account_id": account_id,
+        "status": "expired",
+        "code": "no_login_data",
+        "message": "无登录数据，请在「账号管理」重新扫码。",
+        "remind": True,
+        "rescan_path": f"/api/accounts/{account_id}/rescan",
+    }
+    if not acc.get("login_data_enc"):
+        return base
+    try:
+        state = json.loads(decrypt_login_data(acc["login_data_enc"]))
+        cookies = {c.get("name"): c.get("value")
+                   for c in state.get("cookies", []) if isinstance(c, dict)}
+    except Exception:  # noqa: BLE001
+        base["code"] = "login_unreadable"
+        base["message"] = "登录数据无法读取，请重新扫码。"
+        return base
+    missing = [name for name in ("a1", "web_session") if not cookies.get(name)]
+    if missing:
+        base["code"] = "cookie_incomplete"
+        base["message"] = (
+            f"登录失效：Cookie 缺少 {'、'.join(missing)}。请重新扫码。"
+        )
+        return base
+    last = int(acc.get("last_check_at") or 0)
+    age = int(time.time()) - last if last else 0
+    remind = bool(last and age > 7 * 86400)
+    message = "登录态有效（已检测到 a1 与 web_session）。"
+    if remind:
+        message = "登录态已超过 7 天未复查。建议再点一次检查；采集若失败请重新扫码。"
+    return {
+        "ok": True,
+        "account_id": account_id,
+        "status": "valid",
+        "code": "login_valid",
+        "message": message,
+        "remind": remind,
+        "rescan_path": f"/api/accounts/{account_id}/rescan",
+    }
+
+
 def decrypt_profile_to_dir(account_id: int, dest: Path) -> bool:
     """把账号登录态解密写入临时 profile 目录，供采集引擎使用"""
     acc = db.get_account(account_id)
