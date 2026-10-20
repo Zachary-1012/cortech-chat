@@ -1,0 +1,102 @@
+:root {
+  color: #2a241c;
+  background: #f6f1e8;
+  font: 14px/1.45 "Segoe UI", "PingFang SC", sans-serif;
+}
+
+body {
+  width: 340px;
+  margin: 0;
+  padding: 16px 16px 18px;
+}
+
+.brand {
+  margin: 0;
+  letter-spacing: 0.04em;
+  font-size: 12px;
+  color: #8a5a32;
+}
+
+h1 {
+  margin: 2px 0 8px;
+  font-size: 18px;
+  font-weight: 650;
+}
+
+.lead {
+  margin: 0 0 12px;
+  color: #5c5348;
+}
+
+label {
+  display: block;
+  margin: 10px 0 4px;
+  font-size: 12px;
+}
+
+.row {
+  display: flex;
+  gap: 6px;
+}
+
+input[type="url"] {
+  flex: 1;
+  min-width: 0;
+  border: 1px solid #ddcbb6;
+  border-radius: 8px;
+  padding: 8px;
+  background: #fffdf9;
+  color: inherit;
+}
+
+button {
+  border: 0;
+  border-radius: 8px;
+  padding: 8px 12px;
+  background: #c45c26;
+  color: #fffdf9;
+  cursor: pointer;
+}
+
+button.secondary {
+  width: 100%;
+  margin-top: 10px;
+  background: #2a241c;
+}
+
+button:disabled {
+  background: #c8b8a6;
+  cursor: not-allowed;
+}
+
+.preview {
+  margin: 8px 0 0;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: #fff;
+}
+
+.check {
+  display: flex;
+  gap: 8px;
+  align-items: flex-start;
+  margin: 12px 0;
+}
+
+.check span {
+  font-size: 13px;
+}
+
+#send {
+  width: 100%;
+}
+
+.status {
+  min-height: 1.2em;
+  margin: 10px 0 0;
+  color: #5c5348;
+}
+
+.status.bad {
+  color: #9a3412;
+}

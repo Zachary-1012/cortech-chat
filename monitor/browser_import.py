@@ -311,6 +311,82 @@ def _locate_profile(key: str) -> Tuple[str, Path, str]:
     raise BrowserImportError("未找到该浏览器登录态，可能已被清除，请重新检测")
 
 
+def _state_has_login(state: Dict[str, Any]) -> bool:
+    names = set()
+    for c in state.get("cookies") or []:
+        if not isinstance(c, dict) or not c.get("value"):
+            continue
+        domain = str(c.get("domain") or "")
+        if domain and "xiaohongshu" not in domain and "rednote" not in domain:
+            continue
+        names.add(c.get("name"))
+    return "a1" in names and "web_session" in names
+
+
+def _find_storage_state(path: Path) -> Optional[Path]:
+    if path.is_file() and path.name == "storage_state.json":
+        return path
+    for cand in (path / "storage_state.json", path / "Default" / "storage_state.json"):
+        if cand.is_file():
+            return cand
+    return None
+
+
+def _rows_from_configured_dir(path: Path) -> List[Dict[str, Any]]:
+    """只读调用者指定的那一个目录，不扫描其他浏览器。"""
+    if (path / "Local State").is_file():
+        profiles = _iter_profiles(path)
+        ordered = (["Default"] if "Default" in profiles else []) + [
+            p for p in profiles if p != "Default"]
+        for profile in ordered:
+            rows = _read_profile_cookie_rows(path, profile)
+            if _has_login(_cookie_dict(rows)):
+                return rows
+        return []
+    if (path / "Cookies").exists() or (path / "Network" / "Cookies").exists():
+        return _read_profile_cookie_rows(path.parent, path.name)
+    return []
+
+
+def load_profile_storage_state(path: Path) -> Dict[str, Any]:
+    """读取用户指定目录里已经存在的小红书登录态。
+
+    没有 a1 / web_session 就拒绝。不打开登录页，不代为登录。
+    """
+    path = Path(path).expanduser()
+    if not path.exists():
+        raise BrowserImportError("指定的 profile 目录不存在。请先在自己的浏览器登录小红书。")
+    state_file = _find_storage_state(path)
+    if state_file is not None:
+        try:
+            state = json.loads(state_file.read_text(encoding="utf-8"))
+        except Exception as e:  # noqa: BLE001
+            raise BrowserImportError(
+                "storage_state.json 无法读取。请重新导出你已经登录的会话。"
+            ) from e
+        if not isinstance(state, dict) or not _state_has_login(state):
+            raise BrowserImportError(
+                "该会话里没有完整的本人登录态（缺少 a1 或 web_session）。"
+                "请重新登录后再指定目录。服务端不会代为登录。"
+            )
+        return state
+    try:
+        rows = _rows_from_configured_dir(path)
+    except BrowserImportError:
+        raise
+    except Exception as e:  # noqa: BLE001
+        raise BrowserImportError(
+            "无法读取指定目录里的登录态。请改用插件确认发送，或放入 storage_state.json。"
+        ) from e
+    if not _has_login(_cookie_dict(rows)):
+        raise BrowserImportError(
+            "指定目录里没有你已经登录的小红书会话。"
+            "请先在自己的浏览器登录，再把目录配到 CORTECH_BROWSER_USE_PROFILE。"
+            "服务端不会代为登录。"
+        )
+    return _to_storage_state(rows)
+
+
 def import_login(key: str) -> Dict[str, Any]:
     """用户二次确认后：重新读取所选浏览器登录态 → 转 storage_state → 加密入库。
 

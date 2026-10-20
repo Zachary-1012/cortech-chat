@@ -82,18 +82,71 @@ def collection_fixture_enabled() -> bool:
     )
 
 
+def _flag(name: str) -> str:
+    return (os.environ.get(name) or "").strip().lower()
+
+
+def _flag_on(name: str) -> bool:
+    return _flag(name) in ("1", "true", "yes", "on")
+
+
+def _flag_off(name: str) -> bool:
+    return _flag(name) in ("0", "false", "no", "off")
+
+
+def saas_mode() -> bool:
+    """云上 SaaS。CORTECH_SAAS=1 时，本人 Cookie 握手默认开启。"""
+    return _flag_on("CORTECH_SAAS")
+
+
 def cookie_handshake_enabled() -> bool:
-    """用户主动提交本人 Cookie 的握手。默认关闭。"""
-    return (os.environ.get("CORTECH_ENABLE_COOKIE_HANDSHAKE") or "").strip().lower() in (
-        "1", "true", "yes", "on",
-    )
+    """用户主动提交本人 Cookie 的握手。
+
+    显式 CORTECH_ENABLE_COOKIE_HANDSHAKE=0 始终关闭。
+    显式 =1 始终开启。未设置时，仅 SaaS（CORTECH_SAAS=1）默认开启。
+    本地演示默认仍关闭。
+    """
+    if _flag_off("CORTECH_ENABLE_COOKIE_HANDSHAKE"):
+        return False
+    if _flag_on("CORTECH_ENABLE_COOKIE_HANDSHAKE"):
+        return True
+    return saas_mode()
 
 
 def browser_use_enabled() -> bool:
     """用户指定本机已登录 profile 的可选钩子。默认关闭，不代登录。"""
-    return (os.environ.get("CORTECH_ENABLE_BROWSER_USE") or "").strip().lower() in (
-        "1", "true", "yes", "on",
-    )
+    return _flag_on("CORTECH_ENABLE_BROWSER_USE")
+
+
+def _bounded_int(name: str, default: int, lo: int, hi: int) -> int:
+    raw = (os.environ.get(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        n = int(raw)
+    except ValueError:
+        return default
+    return max(lo, min(hi, n))
+
+
+def account_daily_quota() -> int:
+    """每个小红书账号每天最多计入的采集条数。账号行里的 daily_quota>0 时覆盖此值。"""
+    return _bounded_int("CORTECH_ACCOUNT_DAILY_QUOTA", 300, 1, 5000)
+
+
+def account_skip_sec() -> int:
+    """登录失效或健康检查失败后，该账号暂停参与轮换的秒数。"""
+    return _bounded_int("CORTECH_ACCOUNT_SKIP_SEC", 1800, 60, 7 * 86400)
+
+
+def browser_use_concurrency() -> int:
+    """同时使用「已登录 profile」的采集数。"""
+    return _bounded_int("CORTECH_BROWSER_USE_CONCURRENCY", 1, 1, 3)
+
+
+def browser_use_queue_max() -> int:
+    """等待中的浏览器会话任务上限（不含正在跑的）。"""
+    return _bounded_int("CORTECH_BROWSER_USE_QUEUE", 4, 0, 20)
 
 # 默认采集参数
 DEFAULT_MAX_NOTES = 50                 # 每个关键词最多采集帖子数

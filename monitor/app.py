@@ -31,6 +31,27 @@ app.add_middleware(DynamicCORSMiddleware)  # 动态 CORS：保存域名后即时
 
 SESSION_COOKIE = "cortech_session"
 
+
+def _session_token(request: Request) -> str:
+    """网页用 httponly Cookie；浏览器插件在用户确认后改带 Bearer。
+
+    Bearer 的值就是用户已经登录的 cortech_session，不另发密钥。
+    """
+    auth = request.headers.get("authorization") or ""
+    if auth[:7].lower() == "bearer ":
+        bearer = auth[7:].strip()
+        if bearer:
+            return bearer
+    return request.cookies.get(SESSION_COOKIE) or ""
+
+
+def _require_csrf(request: Request) -> None:
+    token = _session_token(request)
+    provided = request.headers.get("x-csrf-token") or ""
+    if not db.csrf_matches(token, provided):
+        raise HTTPException(
+            403, "安全校验未通过。请先在已登录的 Cortech Chat 里取得校验码，再确认发送。")
+
 # 限流：内存字典 {ip: [timestamps]}
 _login_attempts: Dict[str, List[float]] = {}
 _register_attempts: Dict[str, List[float]] = {}
@@ -62,7 +83,7 @@ class AuthMiddleware(BaseHTTPMiddleware):
                 or path == "/api/setup/status"):
             return await call_next(request)
         uid = None
-        token = request.cookies.get(SESSION_COOKIE)
+        token = _session_token(request)
         if token:
             user = db.get_session_user(token)
             if user:
@@ -108,7 +129,7 @@ def api_setup_status(request: Request):
     """公开自检：库、数据目录、登录组件、当前用户是否已有小红书账号。"""
     from .setup_status import build_setup_status
     uid = None
-    token = request.cookies.get(SESSION_COOKIE)
+    token = _session_token(request)
     if token:
         user = db.get_session_user(token)
         if user:
@@ -177,7 +198,7 @@ def api_auth_login(body: AuthBody, request: Request):
 
 @app.post("/api/auth/logout")
 def api_auth_logout(request: Request):
-    token = request.cookies.get(SESSION_COOKIE)
+    token = _session_token(request)
     if token:
         db.delete_auth_session(token)
     resp = JSONResponse({"ok": True})
@@ -187,12 +208,22 @@ def api_auth_logout(request: Request):
 
 @app.get("/api/auth/me")
 def api_auth_me(request: Request):
-    token = request.cookies.get(SESSION_COOKIE)
+    token = _session_token(request)
     user = db.get_session_user(token) if token else None
     if not user:
         raise HTTPException(401, "未登录")
     return {"id": user["id"], "email": user["email"],
             "created_at": user["created_at"]}
+
+
+@app.get("/api/auth/csrf")
+def api_auth_csrf(request: Request):
+    """给已登录用户（含浏览器插件）签发一次性页面校验码。不返回会话本身。"""
+    token = _session_token(request)
+    csrf = db.issue_csrf(token) if token else None
+    if not csrf:
+        raise HTTPException(401, "未登录，请先登录 Cortech Chat")
+    return {"csrf_token": csrf, "product": "Cortech Chat"}
 FRONTEND_DIST = BASE_DIR / "frontend" / "dist"
 
 
@@ -232,6 +263,7 @@ class CrawlIn(BaseModel):
     engine: Optional[str] = None
     account_id: Optional[int] = None
     aggressive: bool = False
+    use_browser_profile: bool = False
 
 
 class ChatIn(BaseModel):
@@ -377,10 +409,13 @@ def api_trigger_crawl(topic_id: int, body: CrawlIn = CrawlIn()):
     if db.running_task_exists() or crawler_driver.is_running():
         raise HTTPException(409, "已有采集任务在运行，请稍后再试")
     try:
+        if body.use_browser_profile and body.account_id:
+            raise HTTPException(400, "请只选择一种登录态：指定账号，或使用你已经登录的浏览器 profile。")
         task_id = crawler_driver.trigger_crawl(
             topic_id, engine=engine, max_notes=body.max_notes,
             enable_comments=body.enable_comments,
-            account_id=body.account_id, aggressive=body.aggressive)
+            account_id=body.account_id, aggressive=body.aggressive,
+            use_browser_profile=body.use_browser_profile)
     except ValueError as e:
         message = str(e)
         code = "need_xhs_session" if "need_xhs_session" in message else (
@@ -435,28 +470,54 @@ def api_discovered_tags(topic_id: int):
 def api_deep_crawl(topic_id: int, body: CrawlIn = CrawlIn()):
     """一个话题一次性全量采集：20 个 tag 逐个搜索 → 去重 → 详情+评论+作者 → 情感分析 → 入库"""
     from . import topic_crawl
+    from .account_rotation import block_reason, first_eligible, mark_success
+    from .browser_use_worker import BrowserUseError, can_use, ensure_ready
+    from .config import collection_fixture_enabled
     topic = db.get_topic(topic_id)
     if not topic:
         raise HTTPException(404, "话题不存在")
     if db.running_task_exists() or crawler_driver.is_running():
         raise HTTPException(409, "已有采集任务在运行，请稍后再试")
-    # 先检查登录态，无登录时明确提示（不是静默失败）
-    try:
-        cortech_crawler = topic_crawl._get_crawler()
-        ok, hint = cortech_crawler.get_crawler().check_login()
-    except Exception as e:
-        raise HTTPException(500, f"采集器初始化失败：{e}")
-    if not ok:
-        raise HTTPException(401, f"未登录小红书：{hint}。请先在「账号管理」页扫码登录。")
+    if body.use_browser_profile and body.account_id:
+        raise HTTPException(400, "请只选择一种登录态：指定账号，或使用你已经登录的浏览器 profile。")
+    resolved = body.account_id
+    use_profile = bool(body.use_browser_profile)
+    if not collection_fixture_enabled():
+        if use_profile:
+            try:
+                ensure_ready()
+            except BrowserUseError as e:
+                raise HTTPException(400, str(e))
+        elif resolved:
+            reason = block_reason(db.get_account(resolved))
+            if reason:
+                raise HTTPException(400, f"这个账号这次不参与采集：{reason}")
+        else:
+            picked = first_eligible()
+            if picked:
+                resolved = picked["id"]
+            elif can_use():
+                use_profile = True
+            else:
+                try:
+                    crawler = topic_crawl._get_crawler().get_crawler()
+                    ok, hint = crawler.check_login()
+                except Exception as e:
+                    raise HTTPException(500, f"采集器初始化失败：{e}")
+                if not ok:
+                    raise HTTPException(
+                        401, f"未登录小红书：{hint}。请先在「账号管理」扫码，或用插件确认发送你自己的登录态。")
     # 确保有可用的 tag
     tags = topic_crawl.get_crawl_tags(topic_id)
     if not tags:
         raise HTTPException(400, "话题没有可用的采集 tag，请先调用 /expand-tags 扩展")
     # 后台线程执行（复用 crawler_driver 的任务机制）
     import threading
+    uid = db.current_user_id()
 
     def _run():
-        task_id = db.create_task(topic_id, task_type="deep_crawl")
+        db.set_current_user(uid)
+        task_id = db.create_task(topic_id, task_type="deep_crawl", account_id=resolved)
         try:
             db.update_task(task_id, status="running",
                            started_at=int(time.time()))
@@ -465,12 +526,24 @@ def api_deep_crawl(topic_id: int, body: CrawlIn = CrawlIn()):
                     db.update_task(task_id, log_tail=f"[{pct}%] {msg}")
                 else:
                     db.update_task(task_id, log_tail=msg)
-            result = topic_crawl.deep_crawl_topic(
-                topic_id, progress_cb=_progress,
-                max_notes_per_tag=body.max_notes or 50,
-                enable_comments=body.enable_comments
-                if body.enable_comments is not None else True,
-                account_id=body.account_id)
+            if use_profile:
+                from .browser_use_worker import session_scope
+                with session_scope() as profile_dir:
+                    result = topic_crawl.deep_crawl_topic(
+                        topic_id, progress_cb=_progress,
+                        max_notes_per_tag=body.max_notes or 50,
+                        enable_comments=body.enable_comments
+                        if body.enable_comments is not None else True,
+                        profile_dir=profile_dir)
+            else:
+                result = topic_crawl.deep_crawl_topic(
+                    topic_id, progress_cb=_progress,
+                    max_notes_per_tag=body.max_notes or 50,
+                    enable_comments=body.enable_comments
+                    if body.enable_comments is not None else True,
+                    account_id=resolved)
+            if resolved and not collection_fixture_enabled():
+                mark_success(resolved, result.get("notes_total") or 0)
             db.update_task(task_id, status="done",
                            finished_at=int(time.time()),
                            notes_count=result.get("notes_stored", 0),
@@ -480,6 +553,8 @@ def api_deep_crawl(topic_id: int, body: CrawlIn = CrawlIn()):
             db.update_task(task_id, status="failed",
                            finished_at=int(time.time()),
                            error=str(e)[:500])
+        finally:
+            db.set_current_user(None)
     threading.Thread(target=_run, daemon=True).start()
     return {"ok": True, "topic_id": topic_id, "tags_count": len(tags),
             "message": f"已启动全量采集，共 {len(tags)} 个 tag"}
@@ -1627,22 +1702,88 @@ def api_cookie_handshake_status():
     return status()
 
 
-class CookieHandshakeIn(BaseModel):
-    a1: str = ""
-    web_session: str = ""
-    nickname: str = ""
-
-
 @app.post("/api/accounts/cookie-handshake")
-def api_cookie_handshake(body: CookieHandshakeIn):
-    """仅在功能开关打开时，保存用户本人粘贴的 a1 与 web_session。"""
+async def api_cookie_handshake(request: Request):
+    """保存用户本人确认发送的 Cookie。需要已登录会话和 CSRF。响应不回显 Cookie。"""
+    import json
     from .cookie_handshake import HandshakeDisabled, HandshakeRejected, accept_user_cookies
+    _require_csrf(request)
     try:
-        return accept_user_cookies(body.a1, body.web_session, body.nickname)
+        raw = await request.body()
+    except Exception:
+        raise HTTPException(400, "请求格式不正确。")
+    if len(raw) > 65536:
+        raise HTTPException(400, "提交内容过大。请只发送登录所需的 Cookie。")
+    try:
+        body = json.loads(raw.decode("utf-8")) if raw else {}
+    except Exception:
+        raise HTTPException(400, "请求格式不正确。")
+    if not isinstance(body, dict):
+        raise HTTPException(400, "请求格式不正确。")
+    extra = body.get("cookies") if isinstance(body.get("cookies"), dict) else {}
+    try:
+        account_id = body.get("account_id")
+        if account_id is not None and account_id != "":
+            account_id = int(account_id)
+        else:
+            account_id = None
+    except (TypeError, ValueError):
+        raise HTTPException(400, "账号编号不正确。")
+    try:
+        return accept_user_cookies(
+            a1=str(body.get("a1") or ""),
+            web_session=str(body.get("web_session") or ""),
+            nickname=str(body.get("nickname") or ""),
+            account_id=account_id,
+            xhs_user_id=str(body.get("xhs_user_id") or ""),
+            extra_cookies=extra,
+        )
     except HandshakeDisabled as e:
         raise HTTPException(404, str(e))
     except HandshakeRejected as e:
         raise HTTPException(400, str(e))
+
+
+class BrowserUseJobIn(BaseModel):
+    topic_id: int
+    max_notes: Optional[int] = Field(default=None, ge=1, le=500)
+    enable_comments: Optional[bool] = None
+
+
+@app.get("/api/browser-use/status")
+def api_browser_use_status():
+    """是否允许复用你已经登录的 profile。不返回 Cookie。"""
+    from .browser_use_worker import status
+    return status()
+
+
+@app.post("/api/browser-use/jobs")
+def api_browser_use_job(body: BrowserUseJobIn):
+    """用你指定目录里已经登录的会话排队采集。未开启或未登录则拒绝。"""
+    from .browser_use_worker import BrowserUseDisabled, BrowserUseError, ensure_ready
+    try:
+        ensure_ready()
+    except BrowserUseDisabled as e:
+        raise HTTPException(404, str(e))
+    except BrowserUseError as e:
+        raise HTTPException(400, str(e))
+    if db.running_task_exists() or crawler_driver.is_running():
+        raise HTTPException(409, "已有采集任务在运行，请稍后再试")
+    topic = db.get_topic(body.topic_id)
+    if not topic:
+        raise HTTPException(404, "话题不存在")
+    try:
+        task_id = crawler_driver.trigger_crawl(
+            body.topic_id, max_notes=body.max_notes,
+            enable_comments=body.enable_comments,
+            use_browser_profile=True)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return {
+        "ok": True,
+        "task_id": task_id,
+        "message": "已加入队列。将使用你指定的、已经登录的浏览器会话，不会代为登录。",
+    }
 
 
 @app.get("/api/login-status")

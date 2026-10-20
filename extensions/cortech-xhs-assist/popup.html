@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <title>Cortech Chat 小红书助手</title>
+  <link rel="stylesheet" href="popup.css" />
+</head>
+<body>
+  <header>
+    <p class="brand">Cortech Chat</p>
+    <h1>发送我的小红书登录态</h1>
+  </header>
+  <p class="lead">
+    只会读取<strong>你这个浏览器里已经登录</strong>的小红书会话。
+    需要你先预览昵称，再勾选确认才会发送。不会在后台自动读取，也不会登录别人的账号。
+  </p>
+
+  <label for="origin">Cortech Chat 地址</label>
+  <div class="row">
+    <input id="origin" type="url" placeholder="https://你的域名 或 http://127.0.0.1:8000" autocomplete="off" />
+    <button id="save-origin" type="button">保存</button>
+  </div>
+
+  <button id="preview" type="button" class="secondary">预览我的昵称</button>
+  <p id="preview-box" class="preview" hidden></p>
+
+  <label class="check">
+    <input id="confirm" type="checkbox" />
+    <span>我确认这是我自己的小红书账号，并发送到我已登录的 Cortech Chat。</span>
+  </label>
+
+  <button id="send" type="button" disabled>确认发送</button>
+  <p id="status" class="status" role="status"></p>
+  <script src="popup.js"></script>
+</body>
+</html>

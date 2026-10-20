@@ -12,6 +12,7 @@ from __future__ import annotations
 import re
 import time
 from collections import Counter
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from . import db
@@ -294,7 +295,8 @@ def deep_crawl_topic(topic_id: int,
                      progress_cb: Optional[Callable[[int, str], None]] = None,
                      max_notes_per_tag: int = 50,
                      enable_comments: bool = True,
-                     account_id: Optional[int] = None) -> Dict[str, Any]:
+                     account_id: Optional[int] = None,
+                     profile_dir: Optional[Path] = None) -> Dict[str, Any]:
     """一个话题一次性全量采集。
 
     流程：
@@ -352,6 +354,8 @@ def deep_crawl_topic(topic_id: int,
             task_id=0,
             timeout_sec=600,
             log=lambda s: _log(f"[tag:{tag}] {s}"),
+            account_id=None if profile_dir else account_id,
+            profile_dir=profile_dir,
         )
         try:
             result = crawler.crawl(ctx)
@@ -393,7 +397,9 @@ def deep_crawl_topic(topic_id: int,
         progress_cb(96, "正在入库…")
 
     # 入库（复用统一入库，帖子+评论一起）
-    stored_notes, stored_comments = store_unified(topic_id, all_notes, all_comments)
+    stored_notes, stored_comments = store_unified(
+        topic_id, all_notes, all_comments, account_id=account_id,
+        source="browser_use_profile" if profile_dir else "account")
 
     if progress_cb:
         progress_cb(100, "全量采集完成")
