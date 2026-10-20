@@ -1656,7 +1656,11 @@ def api_chat_stream(body: ChatIn):
 def api_list_accounts():
     """账号列表（不含加密登录数据）。每条带 state / state_label。"""
     from .login_flow import decorate_account
-    items = [decorate_account(a) for a in db.list_accounts()]
+    items = []
+    for acc in db.list_accounts_full():
+        view = decorate_account(acc)
+        view.pop("login_data_enc", None)
+        items.append(view)
     return {"items": items,
             "default_id": (db.get_default_account() or {}).get("id")}
 
@@ -1698,11 +1702,18 @@ def api_rescan_account(account_id: int):
 @app.post("/api/accounts/{account_id}/check")
 def api_check_account(account_id: int):
     """检查账号登录态是否有效"""
-    from .login_flow import inspect_account
+    from .login_flow import decorate_account, inspect_account
     try:
-        return inspect_account(account_id)
+        result = dict(inspect_account(account_id))
     except KeyError:
         raise HTTPException(404, "账号不存在")
+    acc = db.get_account(account_id)
+    if acc:
+        view = decorate_account(acc)
+        result["enabled"] = view.get("enabled")
+        result["protection"] = view.get("protection")
+        result["protection_message"] = view.get("protection_message")
+    return result
 
 
 @app.get("/api/login/qrcode")
@@ -1733,30 +1744,72 @@ def api_login_qrcode(account_id: int):
 
 class BrowserImportIn(BaseModel):
     key: str = Field(min_length=1, max_length=200)
+    confirm: bool = False
+
+
+class AccountEnabledIn(BaseModel):
+    enabled: bool
 
 
 @app.get("/api/accounts/browser-available")
 def api_browser_available():
     """检测本地浏览器中的小红书登录态。
 
-    仅在用户点击"从浏览器导入"时触发；只返回昵称/头像，不暴露 Cookie。
-    未经用户点击，后端绝不自动扫描。"""
+    只返回候选（浏览器 / 配置 / 昵称 / 头像 / 站点）和原因。
+    不返回 Cookie，不创建账号，不参与采集。用户必须再勾选确认。"""
     from . import browser_import
     try:
-        items = browser_import.scan_browser_logins()
+        report = browser_import.scan_browser_logins()
     except browser_import.BrowserImportError as e:
         raise HTTPException(400, str(e))
-    return {"items": items}
+    items = list(report.get("items") or []) + browser_import.public_staged()
+    return {
+        "items": items,
+        "reasons": report.get("reasons") or [],
+        "recommended": report.get("recommended") or {},
+        "auto_imported": False,
+    }
 
 
 @app.post("/api/accounts/browser-import")
 def api_browser_import(body: BrowserImportIn):
-    """用户在检测列表中选择账号并二次确认后，导入浏览器登录态（加密入库）。"""
+    """用户在检测列表中选择账号并确认后，才导入浏览器登录态（加密入库）。"""
     from . import browser_import
+    if not body.confirm:
+        raise HTTPException(
+            400,
+            "请在账号管理勾选并确认后再导入。未选择的登录态不会导入，也不会参与采集。",
+        )
     try:
-        return browser_import.import_login(body.key)
+        return browser_import.import_login(body.key, confirmed=True)
     except browser_import.BrowserImportError as e:
         raise HTTPException(400, str(e))
+
+
+@app.post("/api/accounts/{account_id}/enabled")
+def api_account_enabled(account_id: int, body: AccountEnabledIn):
+    """停用后不再参与采集。可以随时重新启用，或直接删除。"""
+    from .login_flow import decorate_account
+    acc = db.get_account(account_id)
+    if not acc:
+        raise HTTPException(404, "账号不存在")
+    db.update_account(account_id, {
+        "enabled": 1 if body.enabled else 0,
+        "check_note": "已启用，可参与采集" if body.enabled else "已停用，不会参与采集",
+    })
+    fresh = db.get_account(account_id) or acc
+    view = decorate_account(fresh)
+    view.pop("login_data_enc", None)
+    return view
+
+
+@app.delete("/api/accounts/detected/{detected_id}")
+def api_discard_detected(detected_id: int):
+    """丢掉还没确认的候选。不会影响已经导入的账号。"""
+    from . import browser_import
+    if not browser_import.discard_detected(detected_id):
+        raise HTTPException(404, "候选不存在")
+    return {"ok": True, "auto_imported": False}
 
 
 @app.get("/api/login/status")
@@ -1800,6 +1853,24 @@ async def api_cookie_handshake(request: Request):
     if not isinstance(body, dict):
         raise HTTPException(400, "请求格式不正确。")
     extra = body.get("cookies") if isinstance(body.get("cookies"), dict) else {}
+    confirmed = body.get("confirm") is True
+    enable = body.get("enable") is True
+    if not confirmed:
+        raise HTTPException(400, "请确认这是你本人的登录态。检测不会自动导入。")
+    if not enable:
+        from .cookie_handshake import HandshakeDisabled, HandshakeRejected, stage_user_cookies
+        try:
+            return stage_user_cookies(
+                a1=str(body.get("a1") or ""),
+                web_session=str(body.get("web_session") or ""),
+                nickname=str(body.get("nickname") or ""),
+                xhs_user_id=str(body.get("xhs_user_id") or ""),
+                extra_cookies=extra,
+            )
+        except HandshakeDisabled as e:
+            raise HTTPException(404, str(e))
+        except HandshakeRejected as e:
+            raise HTTPException(400, str(e))
     try:
         account_id = body.get("account_id")
         if account_id is not None and account_id != "":

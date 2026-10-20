@@ -31,6 +31,15 @@ if not exist "libs\fastapi" (
     echo.
 )
 
+rem 缺少 Playwright Chromium 时尝试安装。失败不阻止启动，扫码还可改用 Edge / Chrome。
+python -c "import os,sys; from pathlib import Path; roots=[Path(os.environ.get('LOCALAPPDATA',''))/'ms-playwright', Path.home()/'.cache'/'ms-playwright']; sys.exit(0 if any(p.is_dir() and any(p.iterdir()) for p in roots) else 1)" >nul 2>nul
+if errorlevel 1 (
+    echo   未检测到 Playwright Chromium，正在尝试安装（失败可忽略）...
+    python -m playwright install chromium
+    if errorlevel 1 echo   [提示] 未能安装 Chromium。扫码登录会改试 Edge / Chrome。
+    echo.
+)
+
 rem 优先用 pythonw.exe（无控制台窗口）；找不到则退回控制台模式
 set "PYW="
 for %%P in (pythonw.exe) do if not defined PYW set "PYW=%%~$PATH:P"
