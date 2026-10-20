@@ -259,6 +259,13 @@ def _run_task_inner(task_id: int, topic: dict, engine: str, max_notes: Optional[
                     if auto_rotate and idx + 1 < len(candidates):
                         _log("[driver] 轮换到下一个健康账号")
                         continue
+                if kind == "risk" and acc_id:
+                    from .account_guard import mark_risk
+                    mark_risk(acc_id, human)
+                    _log(f"[driver] 账号「{acc_name or acc_id}」触发风控，已自动暂停，本任务不立刻重试。")
+                    if auto_rotate and idx + 1 < len(candidates):
+                        _log("[driver] 轮换到下一个健康账号")
+                        continue
                 raise RuntimeError(last_error) from e
         if result is None:
             raise RuntimeError(

@@ -26,6 +26,16 @@ echo   Data directory: %CORTECH_DATA_DIR%
 echo   CORTECH_SAAS=1
 echo   Close this window to stop the server.
 echo.
+
+rem Optional: install Playwright Chromium when the browser bundle is missing.
+rem Failure does not stop the server. QR login can still use Edge or Chrome.
+python -c "import os,sys; from pathlib import Path; roots=[Path(os.environ.get('LOCALAPPDATA',''))/'ms-playwright', Path.home()/'.cache'/'ms-playwright']; sys.exit(0 if any(p.is_dir() and any(p.iterdir()) for p in roots) else 1)" >nul 2>nul
+if errorlevel 1 (
+    echo Playwright Chromium is missing. Trying a one-time install. You can ignore a failure.
+    python -m playwright install chromium
+    if errorlevel 1 echo [warn] Playwright Chromium was not installed. QR login can use Edge or Chrome instead.
+)
+
 python -m monitor.app
 if errorlevel 1 (
     echo.

@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import logging
 import tempfile
 import threading
 import time
@@ -21,6 +22,8 @@ from typing import Dict, Optional
 from . import db
 from .account_crypto import decrypt_login_data, encrypt_login_data
 from .config import login_cache_dir
+
+logger = logging.getLogger("xhs-monitor.login_flow")
 
 # 会话内部状态：idle/starting/waiting/success/expired/failed/cancelled
 # 接口对外只暴露 waiting / success / expired / need_rescan，并带中文说明。
@@ -150,26 +153,27 @@ class LoginSession:
         try:
             asyncio.run(self._async_run())
         except Exception as e:  # noqa: BLE001
+            logger.exception("登录流程异常 account=%s", self.account_id)
             self.status = "failed"
-            self.message = f"登录流程异常：{type(e).__name__}"
+            self.message = public_login_error(e)
 
     async def _async_run(self):
         from playwright.async_api import async_playwright
+        from .account_guard import (
+            STEALTH_INIT_SCRIPT, default_fingerprint, launch_persistent_context)
 
         tmp_profile = Path(tempfile.mkdtemp(prefix="xhs_login_"))
+        fingerprint = default_fingerprint()
         try:
             async with async_playwright() as pw:
-                ctx = await pw.chromium.launch_persistent_context(
-                    user_data_dir=str(tmp_profile),
-                    headless=True,  # 铁律：不许弹出浏览器窗口
-                    executable_path="/opt/meta-chromium/chrome",  # 临时：Brio VM 用 meta-chromium
-                    args=["--no-sandbox", "--disable-blink-features=AutomationControlled"],
-                    viewport={"width": 1280, "height": 800},
-                )
+                ctx = await launch_persistent_context(
+                    pw, tmp_profile, fingerprint=fingerprint, headless=True)
                 try:
                     page = ctx.pages[0] if ctx.pages else await ctx.new_page()
+                    await page.add_init_script(STEALTH_INIT_SCRIPT)
                     await page.goto("https://www.xiaohongshu.com/explore",
                                     wait_until="domcontentloaded", timeout=30000)
+                    fingerprint = await self._capture_fingerprint(page, fingerprint)
                     # 点登录按钮（如未自动弹出登录框）
                     try:
                         btn = page.locator(
@@ -197,33 +201,80 @@ class LoginSession:
                         self.status = "expired"
                         self.message = "二维码已过期，请重新获取"
                         return
-                    # 成功：保存登录态
-                    await self._save_login_state(ctx, page)
+                    # 成功：保存登录态（指纹与这次登录浏览器一致）
+                    await self._save_login_state(ctx, page, fingerprint)
                 finally:
                     await ctx.close()
         finally:
             import shutil
             shutil.rmtree(tmp_profile, ignore_errors=True)
 
+    async def _capture_fingerprint(self, page, base: Dict) -> Dict:
+        fp = dict(base)
+        try:
+            ua = await page.evaluate("() => navigator.userAgent")
+            if isinstance(ua, str) and ua.strip():
+                fp["user_agent"] = ua.strip()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            tz = await page.evaluate(
+                "() => Intl.DateTimeFormat().resolvedOptions().timeZone")
+            if isinstance(tz, str) and tz.strip():
+                fp["timezone_id"] = tz.strip()
+        except Exception:  # noqa: BLE001
+            pass
+        return fp
+
+    async def _b64_from_src(self, src: str) -> str:
+        """MediaCrawler 同款：data URL 直接取，http 再下载。"""
+        if src.startswith("data:image"):
+            return src.split(",", 1)[1] if "," in src else ""
+        if src.startswith("http://") or src.startswith("https://"):
+            import httpx
+            async with httpx.AsyncClient(timeout=15, follow_redirects=True) as cli:
+                resp = await cli.get(src)
+                if resp.status_code == 200 and resp.content:
+                    return base64.b64encode(resp.content).decode("ascii")
+        return ""
+
+    async def _screenshot_b64(self, element) -> str:
+        png = await element.screenshot(type="png")
+        if png:
+            return base64.b64encode(png).decode("ascii")
+        return ""
+
     async def _extract_qrcode(self, page) -> str:
-        """提取 img.qrcode-img 的 base64（兼容 data:URL 与 http URL）"""
+        """提取 img.qrcode-img。没有 src 时截二维码区域（MediaCrawler 的回退）。"""
+        selectors = ("img.qrcode-img", "xpath=//img[@class='qrcode-img']")
+        region_selectors = (".qrcode-img", ".qrcode", "[class*='qrcode']")
         for _ in range(20):
             if self._stop.is_set():
                 return ""
-            try:
-                el = await page.wait_for_selector(
-                    "xpath=//img[@class='qrcode-img']", timeout=3000)
-                src = await el.get_attribute("src") or ""
-                if src.startswith("data:image"):
-                    return src.split(",", 1)[1] if "," in src else src
-                if src.startswith("http"):
-                    import httpx
-                    async with httpx.AsyncClient(timeout=15) as cli:
-                        r = await cli.get(src)
-                        if r.status_code == 200:
-                            return base64.b64encode(r.content).decode("ascii")
-            except Exception:  # noqa: BLE001
-                pass
+            for selector in selectors:
+                try:
+                    el = await page.query_selector(selector)
+                    if not el:
+                        continue
+                    src = await el.get_attribute("src") or ""
+                    b64 = await self._b64_from_src(src)
+                    if b64:
+                        return b64
+                    shot = await self._screenshot_b64(el)
+                    if shot:
+                        return shot
+                except Exception:  # noqa: BLE001
+                    logger.exception("提取登录二维码失败，改试截图")
+            for selector in region_selectors:
+                try:
+                    el = await page.query_selector(selector)
+                    if not el:
+                        continue
+                    shot = await self._screenshot_b64(el)
+                    if shot:
+                        return shot
+                except Exception:  # noqa: BLE001
+                    pass
             await asyncio.sleep(1)
         return ""
 
@@ -256,7 +307,7 @@ class LoginSession:
             await asyncio.sleep(2)
         return False
 
-    async def _save_login_state(self, ctx, page):
+    async def _save_login_state(self, ctx, page, fingerprint: Optional[Dict] = None):
         state_json = await ctx.storage_state()
         # 提取昵称/用户ID
         nickname, user_id, avatar = "", "", ""
@@ -272,6 +323,7 @@ class LoginSession:
         apply_successful_login(
             self.account_id, state_json,
             nickname=nickname, xhs_user_id=user_id, avatar_url=avatar,
+            fingerprint=fingerprint,
         )
 
 
@@ -340,9 +392,31 @@ def _finish_health(payload: dict) -> dict:
     return payload
 
 
+def public_login_error(exc: BaseException) -> str:
+    """给 /api/login/status 的可读说明。完整堆栈只写日志。"""
+    name = type(exc).__name__
+    detail = ""
+    text = str(exc).strip()
+    if text:
+        detail = text.splitlines()[0][:180]
+    low = f"{name} {detail}".lower()
+    if any(token in low for token in (
+        "executable", "browser", "chromium", "chrome", "playwright", "msedge",
+    )):
+        return (
+            "没有启动浏览器，二维码无法生成。请运行 python -m playwright install chromium，"
+            "或安装 Microsoft Edge / Google Chrome，也可以设置 CORTECH_CHROMIUM_PATH"
+            f" 指向浏览器程序。（{name}）"
+        )
+    if detail:
+        return f"登录流程异常：{name}：{detail}"
+    return f"登录流程异常：{name}"
+
+
 def apply_successful_login(account_id: int, storage_state: dict, *,
                            nickname: str = "", xhs_user_id: str = "",
-                           avatar_url: str = "") -> Dict:
+                           avatar_url: str = "",
+                           fingerprint: Optional[Dict] = None) -> Dict:
     """扫码成功后的落库。账号变为 valid，进行中的会话变为 success。"""
     nickname = (nickname or "").strip()
     display = nickname or f"小红书账号{account_id}"
@@ -362,6 +436,8 @@ def apply_successful_login(account_id: int, storage_state: dict, *,
         (cache / "storage_state.json").write_text(state_str, encoding="utf-8")
     except Exception:  # noqa: BLE001
         pass
+    from .account_guard import arm_fresh_login, default_fingerprint
+    arm_fresh_login(account_id, fingerprint or default_fingerprint())
     sess = get_manager().get_session(account_id)
     if sess:
         sess.status = "success"
@@ -443,11 +519,17 @@ def inspect_account(account_id: int) -> dict:
 def decorate_account(acc: dict) -> dict:
     """账号列表附加对外状态，不改库存的 status（界面仍用 valid/pending/expired）。"""
     view = dict(acc)
+    view.pop("login_data_enc", None)
     sess = get_manager().get_session(acc.get("id"))
     snap = sess.snapshot() if sess else account_state_payload(acc)
     view["state"] = snap["state"]
     view["state_label"] = snap["state_label"]
     view["login_message"] = snap["message"]
+    from .account_guard import is_enabled, public_status
+    view["enabled"] = 1 if is_enabled(acc) else 0
+    protection = public_status(acc)
+    view["protection"] = protection
+    view["protection_message"] = protection.get("message") or ""
     return view
 
 

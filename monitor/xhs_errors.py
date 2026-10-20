@@ -14,7 +14,9 @@ from typing import Any, Dict, Optional, Tuple
 # 网页端常见：笔记不存在、已删除、不可浏览
 DELETED_CODES = {-3, -404, 404, -10404, 300013}
 LOGIN_CODES = {-100, -101}
-RISK_CODES = {300012, 300015, 300017}
+# 461/471 验证码或访问校验；300011 账号异常。出现后暂停该账号，不立刻重试。
+RISK_CODES = {300011, 300012, 300015, 300017, 461, 471}
+_RISK_HINTS = ("验证码", "captcha", "频繁", "frequent", "账号异常", "访问异常", "风控")
 
 _DELETED_HINTS = ("不存在", "已删除", "无法浏览", "not found", "note not found")
 
@@ -42,10 +44,10 @@ def classify_biz_code(code: Any, msg: str = "") -> Tuple[str, str]:
             "login",
             f"小红书登录失效（code={code}）。请在「账号管理」用本人账号重新扫码后再采集。",
         )
-    if code_i in RISK_CODES:
+    if code_i in RISK_CODES or any(h in text or h in low for h in _RISK_HINTS):
         return (
             "risk",
-            f"小红书风控或访问受限（code={code}）。请降低频率，或改用另一个已登录的采集账号。",
+            f"小红书风控或访问受限（code={code}）。已暂停该账号，不会立刻重试。",
         )
     return ("fetch", f"采集接口失败（code={code}）：{shown}")
 
@@ -61,6 +63,11 @@ def classify_http_status(status: int, on_detail: bool) -> Optional[Tuple[str, st
         return (
             "login",
             f"小红书登录失效（HTTP {status}）。请在「账号管理」用本人账号重新扫码后再采集。",
+        )
+    if status in (461, 471):
+        return (
+            "risk",
+            f"小红书要求验证或访问受限（HTTP {status}）。已暂停该账号，不会立刻重试。",
         )
     return None
 
@@ -105,7 +112,8 @@ def failure_kind_from_message(message: str) -> str:
     text = message or ""
     if any(s in text for s in ("登录失效", "重新扫码", "Cookie 缺少", "尚未扫码", "无登录数据")):
         return "login"
-    if "风控" in text or "访问受限" in text or "账号受限" in text:
+    if any(s in text for s in ("风控", "访问受限", "账号受限", "验证码", "频繁",
+                               "账号异常", "code=461", "code=471", "300011")):
         return "risk"
     if "已删除" in text or "不存在" in text:
         return "deleted"

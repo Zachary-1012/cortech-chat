@@ -260,6 +260,20 @@ CREATE TABLE IF NOT EXISTS note_collections (
     collected_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_note_collections_post ON note_collections(user_id, post_id);
+CREATE TABLE IF NOT EXISTS xhs_detected_logins (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER,
+    source TEXT NOT NULL DEFAULT '',
+    browser TEXT NOT NULL DEFAULT '',
+    profile TEXT NOT NULL DEFAULT '',
+    nickname TEXT NOT NULL DEFAULT '',
+    avatar_url TEXT NOT NULL DEFAULT '',
+    region TEXT NOT NULL DEFAULT '',
+    candidate_key TEXT NOT NULL DEFAULT '',
+    payload_enc TEXT NOT NULL DEFAULT '',
+    created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_detected_user ON xhs_detected_logins(user_id);
 """
 
 # 增量迁移：老库缺列时补列（表已存在时 CREATE TABLE 不生效）
@@ -273,6 +287,12 @@ _MIGRATIONS = {
         "quota_day": "TEXT NOT NULL DEFAULT ''",
         "skip_until": "INTEGER NOT NULL DEFAULT 0",
         "fail_streak": "INTEGER NOT NULL DEFAULT 0",
+        "enabled": "INTEGER NOT NULL DEFAULT 1",
+        "logged_in_at": "INTEGER NOT NULL DEFAULT 0",
+        "warmup_until": "INTEGER NOT NULL DEFAULT 0",
+        "risk_pause_until": "INTEGER NOT NULL DEFAULT 0",
+        "risk_code": "TEXT NOT NULL DEFAULT ''",
+        "fingerprint_json": "TEXT NOT NULL DEFAULT ''",
     },
     "auth_sessions": {"csrf_token": "TEXT NOT NULL DEFAULT ''"},
     "tasks": {"engine": "TEXT NOT NULL DEFAULT 'cortech_browser'",
@@ -1160,7 +1180,9 @@ def list_accounts() -> List[Dict[str, Any]]:
         rows = conn.execute(
             "SELECT id, nickname, xhs_user_id, avatar_url, status, added_at,"
             " last_used_at, last_check_at, check_note, daily_quota, quota_used,"
-            f" quota_day, skip_until, fail_streak FROM xhs_accounts {clause} ORDER BY id",
+            " quota_day, skip_until, fail_streak, enabled, logged_in_at,"
+            " warmup_until, risk_pause_until, risk_code, fingerprint_json"
+            f" FROM xhs_accounts {clause} ORDER BY id",
             params,
         ).fetchall()
         return [dict(r) for r in rows]
@@ -1216,7 +1238,9 @@ def create_account(nickname: str = "", xhs_user_id: str = "") -> int:
 def update_account(account_id: int, fields: Dict[str, Any]) -> bool:
     allowed = {"nickname", "xhs_user_id", "avatar_url", "status",
                "login_data_enc", "last_used_at", "last_check_at", "check_note",
-               "daily_quota", "quota_used", "quota_day", "skip_until", "fail_streak"}
+               "daily_quota", "quota_used", "quota_day", "skip_until", "fail_streak",
+               "enabled", "logged_in_at", "warmup_until", "risk_pause_until",
+               "risk_code", "fingerprint_json"}
     sets = {k: v for k, v in fields.items() if k in allowed}
     if not sets:
         return False
@@ -1235,6 +1259,63 @@ def delete_account(account_id: int) -> bool:
     _uw(where, params)
     with _lock, _connect() as conn:
         cur = conn.execute(f"DELETE FROM xhs_accounts WHERE {' AND '.join(where)}", params)
+        return cur.rowcount > 0
+
+
+def add_detected_login(source: str, browser: str, profile: str, nickname: str,
+                       avatar_url: str, region: str, payload_enc: str) -> int:
+    """只保存候选。payload 是密文，列表接口不读这一列。"""
+    now = int(time.time())
+    with _lock, _connect() as conn:
+        cur = conn.execute(
+            "INSERT INTO xhs_detected_logins (user_id, source, browser, profile,"
+            " nickname, avatar_url, region, candidate_key, payload_enc, created_at)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (_current_uid.get(), source or "", browser or "", profile or "",
+             nickname or "", avatar_url or "", region or "", "", payload_enc or "", now),
+        )
+        new_id = int(cur.lastrowid)
+        conn.execute(
+            "UPDATE xhs_detected_logins SET candidate_key=? WHERE id=?",
+            (f"detected:{new_id}", new_id),
+        )
+        return new_id
+
+
+def list_detected_logins() -> List[Dict[str, Any]]:
+    """候选列表。不返回 payload_enc。"""
+    where, params = [], []
+    _uw(where, params)
+    clause = f"WHERE {' AND '.join(where)}" if where else ""
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT id, source, browser, profile, nickname, avatar_url, region,"
+            f" candidate_key, created_at FROM xhs_detected_logins {clause} ORDER BY id DESC",
+            params,
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def get_detected_login(detected_id: int) -> Optional[Dict[str, Any]]:
+    """确认导入时在服务端读取密文。不要把返回值交给前端。"""
+    where, params = ["id=?"], [detected_id]
+    _uw(where, params)
+    with _connect() as conn:
+        row = conn.execute(
+            f"SELECT * FROM xhs_detected_logins WHERE {' AND '.join(where)}",
+            params,
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def delete_detected_login(detected_id: int) -> bool:
+    where, params = ["id=?"], [detected_id]
+    _uw(where, params)
+    with _lock, _connect() as conn:
+        cur = conn.execute(
+            f"DELETE FROM xhs_detected_logins WHERE {' AND '.join(where)}",
+            params,
+        )
         return cur.rowcount > 0
 
 

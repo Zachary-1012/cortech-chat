@@ -139,6 +139,24 @@ def account_skip_sec() -> int:
     return _bounded_int("CORTECH_ACCOUNT_SKIP_SEC", 1800, 60, 7 * 86400)
 
 
+def login_warmup_sec() -> int:
+    """刚登录后完全不采集的秒数。0 表示关闭保护期。"""
+    return _bounded_int("CORTECH_LOGIN_WARMUP_SEC", 600, 0, 7 * 86400)
+
+
+def login_ramp_sec() -> int:
+    """保护期结束后的慢速恢复秒数。此期间请求间隔更长。"""
+    return _bounded_int("CORTECH_RAMP_SEC", 3600, 0, 7 * 86400)
+
+
+def quiet_hours_spec() -> str:
+    """北京时间安静时段，例如 0-7。off 表示不启用。未设置时默认 0-7。"""
+    raw = (os.environ.get("CORTECH_QUIET_HOURS") or "").strip()
+    if not raw:
+        return "0-7"
+    return raw
+
+
 def browser_use_concurrency() -> int:
     """同时使用「已登录 profile」的采集数。"""
     return _bounded_int("CORTECH_BROWSER_USE_CONCURRENCY", 1, 1, 3)

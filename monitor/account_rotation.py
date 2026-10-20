@@ -37,15 +37,26 @@ def quota_used_today(acc: Dict[str, Any]) -> int:
 
 
 def block_reason(acc: Optional[Dict[str, Any]]) -> str:
-    """不能参与本轮采集时返回中文原因。可以参与则返回空字符串。不写库。"""
+    """不能参与本轮采集时返回中文原因。可以参与则返回空字符串。不写库。
+
+    只看已启用的 xhs_accounts。检测候选（浏览器扫描、CDP、插件暂存）不在此列。
+    """
     if not acc:
         return "账号不存在"
+    from .account_guard import enabled_block_reason, pace_block_reason
+    enabled_msg = enabled_block_reason(acc)
+    if enabled_msg:
+        return enabled_msg
     if acc.get("status") != "valid":
         return "登录态不是有效，请在「账号管理」重新扫码或从插件重新确认发送"
-    from .login_flow import account_health
-    health = account_health(acc)
-    if not health.get("ok"):
-        return health.get("message") or "健康检查未通过"
+    if "login_data_enc" in acc:
+        from .login_flow import account_health
+        health = account_health(acc)
+        if not health.get("ok"):
+            return health.get("message") or "健康检查未通过"
+    pace = pace_block_reason(acc)
+    if pace:
+        return pace
     skip_until = int(acc.get("skip_until") or 0)
     if skip_until > int(time.time()):
         return "这个账号刚刚采集失败，先跳过，稍后再轮到它"

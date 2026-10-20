@@ -190,10 +190,16 @@ def main():
 
     _flag_names = ("CORTECH_SAAS", "CORTECH_ENABLE_COOKIE_HANDSHAKE",
                    "CORTECH_ENABLE_BROWSER_USE", "CORTECH_BROWSER_USE_PROFILE",
-                   "CORTECH_BROWSER_USE_CONCURRENCY", "CORTECH_BROWSER_USE_QUEUE")
+                   "CORTECH_BROWSER_USE_CONCURRENCY", "CORTECH_BROWSER_USE_QUEUE",
+                   "CORTECH_LOGIN_WARMUP_SEC", "CORTECH_QUIET_HOURS",
+                   "CORTECH_RAMP_SEC", "CORTECH_BROWSER_CDP")
     _saved_flags = {key: os.environ.pop(key, None) for key in _flag_names}
     good_id = bad_id = full_id = None
     try:
+        os.environ["CORTECH_LOGIN_WARMUP_SEC"] = "0"
+        os.environ["CORTECH_QUIET_HOURS"] = "off"
+        os.environ["CORTECH_RAMP_SEC"] = "0"
+        os.environ["CORTECH_BROWSER_CDP"] = "0"
         check("本地默认关闭握手", cookie_handshake_enabled() is False)
         os.environ["CORTECH_SAAS"] = "1"
         check("SaaS 默认开启握手", cookie_handshake_enabled() is True)
@@ -668,6 +674,7 @@ def main():
 
     root = __import__("pathlib").Path(__file__).resolve().parent.parent
     saas_bat = (root / "start-saas.bat").read_text(encoding="ascii")
+    cortech_bat = (root / "start-cortech.bat").read_text(encoding="utf-8")
     check("Windows SaaS 启动脚本不打开桌面、不安装包",
           "CORTECH_SAAS=1" in saas_bat
           and "python -m monitor.app" in saas_bat
@@ -679,6 +686,10 @@ def main():
     ps1 = (root / "extensions" / "build-zip.ps1").read_text(encoding="utf-8")
     check("Windows 插件 zip 脚本",
           "cortech-xhs-assist" in ps1 and "ZipFile" in ps1 and "manifest.json" in ps1)
+    check("启动脚本在缺少浏览器时安装 chromium（失败不阻断）",
+          "python -m playwright install chromium" in saas_bat
+          and "python -m playwright install chromium" in cortech_bat
+          and "pip " not in saas_bat.lower())
 
     from monitor.config import login_cache_dir
     from monitor.login_flow import (apply_successful_login, get_manager,
@@ -686,6 +697,8 @@ def main():
     cache_file = login_cache_dir() / "storage_state.json"
     cache_backup = cache_file.read_text(encoding="utf-8") if cache_file.exists() else None
     set_launch_browser(False)
+    os.environ["CORTECH_LOGIN_WARMUP_SEC"] = "0"
+    os.environ["CORTECH_QUIET_HOURS"] = "off"
     p3_email = f"p3-qr-{int(time.time())}@example.com"
     aid = need_id = None
     try:
@@ -794,6 +807,8 @@ def main():
                     crawl_mod.threading.Thread = old_thread
     finally:
         set_launch_browser(True)
+        os.environ.pop("CORTECH_LOGIN_WARMUP_SEC", None)
+        os.environ.pop("CORTECH_QUIET_HOURS", None)
         get_manager().clear_all()
         if cache_backup is None:
             cache_file.unlink(missing_ok=True)
@@ -813,6 +828,352 @@ def main():
             conn.execute("DELETE FROM auth_sessions WHERE user_id IN "
                          "(SELECT id FROM users WHERE email=?)", (p3_email,))
             conn.execute("DELETE FROM users WHERE email=?", (p3_email,))
+
+    # ---- 11. Windows 登录 / 不自动导入 / 账号保护（不访问小红书） ----
+    import inspect as _inspect
+    import random as _random
+    import sqlite3 as _sqlite3
+    from monitor.account_crypto import encrypt_login_data
+    from monitor.account_guard import (ReadOnlyViolation, STEALTH_INIT_SCRIPT,
+                                       assert_readonly_endpoint, chromium_launch_attempts,
+                                       fingerprint_for, mark_risk, next_delay,
+                                       remember_fingerprint)
+    from monitor.account_rotation import block_reason, eligible_accounts
+    from monitor.browser_import import (CookieProtectError, _copy_sqlite, _decrypt_value,
+                                        _is_lock_error, filter_cdp_cookies, import_login,
+                                        public_staged, scan_browser_logins,
+                                        stage_detected_login)
+    from monitor.login_flow import LoginSession, public_login_error
+    from monitor.xhs_errors import classify_biz_code, classify_http_status
+
+    login_src = (_Path(__file__).resolve().parent / "login_flow.py").read_text(encoding="utf-8")
+    import_src_full = (_Path(__file__).resolve().parent / "browser_import.py").read_text(encoding="utf-8")
+    dialog_js = (root / "frontend" / "dist" / "assets" / "CortechLoginStatusDialog-DJ8kHEEH.js").read_text(encoding="utf-8")
+    popup_js_now = (root / "extensions" / "cortech-xhs-assist" / "popup.js").read_text(encoding="utf-8")
+    check("扫码不再写死 Linux Chromium 路径",
+          "/opt/meta-chromium/chrome" not in login_src
+          and "CORTECH_CHROMIUM_PATH" in login_src
+          and "img.qrcode-img" in login_src
+          and "screenshot" in login_src)
+    check("账号管理引导扩展确认或扫码",
+          "小红书助手" in dialog_js and "不会自动导入" in dialog_js
+          and "扫码登录" in dialog_js and "停用" in dialog_js)
+    check("插件确认后只进入候选",
+          "confirm: true" in popup_js_now and "enable: false" in popup_js_now
+          and "账号管理" in (root / "extensions" / "cortech-xhs-assist" / "popup.html").read_text(encoding="utf-8"))
+    check("不实现提权解密 v20",
+          "IElevator" not in import_src_full and "v20" in import_src_full
+          and "create_account" not in _inspect.getsource(scan_browser_logins))
+    saved_path = os.environ.pop("CORTECH_CHROMIUM_PATH", None)
+    try:
+        plan = chromium_launch_attempts()
+        check("默认浏览器顺序：自带 Chromium、Edge、Chrome",
+              plan[0].get("label") == "bundled" and "executable_path" not in plan[0]
+              and any(item.get("channel") == "msedge" for item in plan)
+              and any(item.get("channel") == "chrome" for item in plan))
+        os.environ["CORTECH_CHROMIUM_PATH"] = r"C:\browsers\chrome.exe"
+        only = chromium_launch_attempts()
+        check("CORTECH_CHROMIUM_PATH 优先",
+              len(only) == 1 and only[0].get("executable_path", "").endswith("chrome.exe"))
+    finally:
+        if saved_path is None:
+            os.environ.pop("CORTECH_CHROMIUM_PATH", None)
+        else:
+            os.environ["CORTECH_CHROMIUM_PATH"] = saved_path
+    readable = public_login_error(RuntimeError(
+        "BrowserType.launch_persistent_context: Executable doesn't exist"))
+    check("登录失败说明可读且带异常类型",
+          "没有启动浏览器" in readable and "RuntimeError" in readable
+          and "playwright install chromium" in readable)
+    set_launch_browser(False)
+    boom_sess = LoginSession(0)
+    async def _boom():
+        raise RuntimeError("Executable doesn't exist")
+    boom_sess._async_run = _boom
+    boom_sess._run()
+    snap = boom_sess.snapshot()
+    check("登录状态接口能看到浏览器失败原因",
+          boom_sess.status == "failed" and "没有启动浏览器" in boom_sess.message
+          and snap.get("message") == boom_sess.message)
+    set_launch_browser(True)
+    try:
+        _decrypt_value(b"v20" + b"secret-cookie-blob", b"k" * 32)
+        check("v20 不当成明文", False)
+    except CookieProtectError as exc:
+        check("v20 不当成明文", exc.code == "v20" and "secret-cookie-blob" not in str(exc))
+    locked = OSError("being used by another process")
+    locked.winerror = 32
+    check("识别 Cookies 文件锁", _is_lock_error(locked))
+    real_copy = __import__("monitor.browser_import", fromlist=["shutil"]).shutil.copy2
+    def _locked_copy(*_args, **_kwargs):
+        err = PermissionError("WinError 32")
+        err.winerror = 32
+        raise err
+    __import__("monitor.browser_import", fromlist=["shutil"]).shutil.copy2 = _locked_copy
+    try:
+        _copy_sqlite(_Path(__file__))
+        check("复制被锁的 Cookie 库会返回 locked", False)
+    except CookieProtectError as exc:
+        check("复制被锁的 Cookie 库会返回 locked", exc.code == "locked")
+    finally:
+        __import__("monitor.browser_import", fromlist=["shutil"]).shutil.copy2 = real_copy
+
+    kept = filter_cdp_cookies([
+        {"name": "a1", "value": "cdp-secret-a1-value", "domain": ".xiaohongshu.com"},
+        {"name": "web_session", "value": "cdp-secret-web", "domain": ".xiaohongshu.cn"},
+        {"name": "a1", "value": "nope", "domain": ".example.com"},
+    ])
+    check("CDP 只保留小红书 com/cn/hk",
+          len(kept) == 2 and all(_x.endswith("xiaohongshu.com") or _x.endswith("xiaohongshu.cn")
+                                 for _x in (row["domain"] for row in kept)))
+
+    os.environ["CORTECH_BROWSER_CDP"] = "0"
+    os.environ["CORTECH_LOGIN_WARMUP_SEC"] = "0"
+    os.environ["CORTECH_QUIET_HOURS"] = "off"
+    os.environ["CORTECH_RAMP_SEC"] = "0"
+    secret_a1 = "scanA1ValueShouldNotLeak99"
+    secret_web = "scanWebValueShouldNotLeak99"
+    profile_root = _Path(tempfile.mkdtemp(prefix="cortech_scan_"))
+    v20_root = _Path(tempfile.mkdtemp(prefix="cortech_v20_"))
+    guard_ids = []
+    detected_id = None
+    try:
+        def _write_cookies(root, rows):
+            (root / "Local State").write_text(_json.dumps({
+                "os_crypt": {"encrypted_key": __import__("base64").b64encode(b"k" * 32).decode(),
+                             "app_bound_encrypted_key": "present"},
+            }), encoding="utf-8")
+            ck = root / "Default" / "Network"
+            ck.mkdir(parents=True)
+            conn = _sqlite3.connect(ck / "Cookies")
+            conn.execute(
+                "CREATE TABLE cookies (host_key TEXT, name TEXT, encrypted_value BLOB,"
+                " value TEXT, path TEXT, expires_utc INTEGER, is_secure INTEGER,"
+                " is_httponly INTEGER, samesite INTEGER)")
+            conn.executemany(
+                "INSERT INTO cookies VALUES (?,?,?,?,?,?,?,?,?)", rows)
+            conn.commit()
+            conn.close()
+
+        _write_cookies(profile_root, [
+            (".xiaohongshu.com", "a1", b"", secret_a1, "/", 0, 1, 0, -1),
+            (".xiaohongshu.com", "web_session", b"", secret_web, "/", 0, 1, 1, -1),
+        ])
+        _write_cookies(v20_root, [
+            (".xiaohongshu.com", "a1", b"v20secret-cookie-blob", "", "/", 0, 1, 0, -1),
+            (".xiaohongshu.com", "web_session", b"v20secret-cookie-blob", "", "/", 0, 1, 1, -1),
+        ])
+        before_ids = {row["id"] for row in db.list_accounts()}
+
+        def _info(_cookies):
+            return {"nickname": "候选昵称", "avatar_url": "https://example.test/a.png", "uid": "uid-scan"}
+
+        report = scan_browser_logins(roots=[("Chrome", profile_root)], fetch_info=_info)
+        dumped = _json.dumps(report, ensure_ascii=False)
+        check("扫描只列出候选且不含 Cookie",
+              report.get("auto_imported") is False
+              and report["items"] and report["items"][0]["nickname"] == "候选昵称"
+              and report["items"][0]["region"] == "www.xiaohongshu.com"
+              and report["items"][0]["browser"] == "Chrome"
+              and secret_a1 not in dumped and secret_web not in dumped
+              and {row["id"] for row in db.list_accounts()} == before_ids)
+        v20_report = scan_browser_logins(roots=[("Edge", v20_root)], fetch_info=_info)
+        v20_dump = _json.dumps(v20_report, ensure_ascii=False)
+        check("v20 返回原因且不导入",
+              v20_report.get("auto_imported") is False
+              and not v20_report["items"]
+              and any(r.get("code") == "v20" for r in v20_report["reasons"])
+              and "secret-cookie-blob" not in v20_dump
+              and v20_report["recommended"]["action"] == "extension")
+        try:
+            import_login(report["items"][0]["key"], confirmed=False)
+            check("未确认不能导入扫描结果", False)
+        except Exception as exc:
+            check("未确认不能导入扫描结果",
+                  "不会自动导入" in str(exc) and {row["id"] for row in db.list_accounts()} == before_ids)
+        import monitor.browser_import as _bi
+        async def _fake_info(_cookies):
+            return {"nickname": "已确认导入", "avatar_url": "", "uid": "uid-imp"}
+        old_fetch = _bi._fetch_self_info
+        old_dirs = _bi._user_data_dirs
+        _bi._fetch_self_info = _fake_info
+        _bi._user_data_dirs = lambda: [("Chrome", profile_root)]
+        try:
+            imported = import_login("Chrome||Default", confirmed=True)
+        finally:
+            _bi._fetch_self_info = old_fetch
+            _bi._user_data_dirs = old_dirs
+        guard_ids.append(imported["id"])
+        check("确认后才写入账号",
+              imported["id"] not in before_ids and db.get_account(imported["id"])["enabled"] == 1
+              and secret_a1 not in _json.dumps(
+                  {k: v for k, v in db.get_account(imported["id"]).items() if k != "login_data_enc"},
+                  ensure_ascii=False))
+        db.update_account(imported["id"], {"enabled": 0})
+        check("停用账号不参与轮换",
+              "停用" in block_reason(db.get_account(imported["id"]))
+              and imported["id"] not in {a["id"] for a in eligible_accounts()})
+        db.update_account(imported["id"], {"enabled": 1, "status": "valid"})
+
+        staged_secret = "stagedA1ValueShouldNotLeak99"
+        before_stage = {row["id"] for row in db.list_accounts()}
+        staged = stage_detected_login(
+            source="extension", browser="Chrome", profile="Default",
+            nickname="未选择的插件登录", region="www.xiaohongshu.com",
+            cookies={"a1": staged_secret, "web_session": "stagedWebValueShouldNotLeak99"})
+        detected_id = staged["detected_id"]
+        staged_dump = _json.dumps({"staged": staged, "public": public_staged()}, ensure_ascii=False)
+        check("未选择的检测结果不进入账号和轮换",
+              staged.get("staged") is True and staged.get("auto_imported") is False
+              and staged.get("account_id", None) in (None,)
+              and staged_secret not in staged_dump
+              and {row["id"] for row in db.list_accounts()} == before_stage
+              and detected_id not in {a["id"] for a in eligible_accounts()}
+              and all(a["id"] in before_stage for a in eligible_accounts()))
+        try:
+            import_login(f"detected:{detected_id}", confirmed=False)
+            check("未确认的候选不能导入", False)
+        except Exception as exc:
+            check("未确认的候选不能导入", "不会自动导入" in str(exc) or "不会参与采集" in str(exc))
+        chosen = import_login(f"detected:{detected_id}", confirmed=True)
+        detected_id = None
+        guard_ids.append(chosen["id"])
+        check("候选确认后才可采集",
+              chosen["id"] in {a["id"] for a in eligible_accounts()}
+              and staged_secret not in _json.dumps(public_staged(), ensure_ascii=False))
+
+        os.environ["CORTECH_LOGIN_WARMUP_SEC"] = "900"
+        from monitor.account_guard import arm_fresh_login
+        arm_fresh_login(chosen["id"])
+        warm_reason = block_reason(db.get_account(chosen["id"]))
+        check("刚登录保护期不采集",
+              "刚登录" in warm_reason and "保护期" in warm_reason
+              and chosen["id"] not in {a["id"] for a in eligible_accounts()})
+        os.environ["CORTECH_LOGIN_WARMUP_SEC"] = "0"
+        os.environ["CORTECH_QUIET_HOURS"] = "0-24"
+        db.update_account(chosen["id"], {"warmup_until": 0, "logged_in_at": 0})
+        check("安静时段不采集", "安静" in block_reason(db.get_account(chosen["id"])))
+        os.environ["CORTECH_QUIET_HOURS"] = "off"
+        db.update_account(chosen["id"], {"skip_until": 0, "risk_pause_until": 0, "fail_streak": 0})
+        mark_risk(chosen["id"], "小红书风控或访问受限（code=461）", code="461")
+        paused = db.get_account(chosen["id"])
+        first_until = int(paused["risk_pause_until"])
+        mark_risk(chosen["id"], "小红书风控或访问受限（code=471）", code="471")
+        paused2 = db.get_account(chosen["id"])
+        from monitor import alerts as _alerts
+        _alerts.init_db()
+        alert_hit = any("自动暂停" in (a.get("title") or "") for a in _alerts.list_alerts().get("items") or [])
+        check("风控自动暂停且不缩短退避",
+              "风控" in block_reason(paused2)
+              and int(paused2["risk_pause_until"]) >= first_until
+              and int(paused2["fail_streak"]) >= 2
+              and alert_hit
+              and chosen["id"] not in {a["id"] for a in eligible_accounts()})
+        db.update_account(chosen["id"], {"risk_pause_until": 0, "skip_until": 0, "fail_streak": 0})
+        delays = [next_delay(None, rng=_random.Random(i)) for i in range(1, 6)]
+        check("请求间隔带抖动",
+              len({round(v, 3) for v in delays}) > 1 and all(3.0 <= v <= 7.5 for v in delays))
+        os.environ["CORTECH_RAMP_SEC"] = "3600"
+        db.update_account(chosen["id"], {
+            "logged_in_at": int(time.time()) - 10,
+            "warmup_until": int(time.time()) - 5,
+        })
+        ramp_delay = next_delay(chosen["id"], rng=_random.Random(2))
+        check("慢速恢复间隔更长", 8.0 <= ramp_delay <= 16.0)
+        os.environ["CORTECH_RAMP_SEC"] = "0"
+        remember_fingerprint(chosen["id"], {
+            "user_agent": "TestAgent/1.0",
+            "viewport": {"width": 1280, "height": 800},
+            "locale": "zh-CN",
+            "timezone_id": "Asia/Shanghai",
+        })
+        fp = fingerprint_for(chosen["id"])
+        check("账号指纹保持一致",
+              fp["user_agent"] == "TestAgent/1.0" and fp["viewport"]["width"] == 1280
+              and fp["locale"] == "zh-CN" and fp["timezone_id"] == "Asia/Shanghai"
+              and "webdriver" in STEALTH_INIT_SCRIPT)
+        assert_readonly_endpoint("POST", "/api/sns/web/v1/search/notes")
+        try:
+            assert_readonly_endpoint("POST", "/api/sns/web/v1/note/like")
+            check("采集拒绝写操作", False)
+        except ReadOnlyViolation:
+            check("采集拒绝写操作", True)
+        check("风控码 461/471/300011 与频繁请求",
+              classify_biz_code(461, "")[0] == "risk"
+              and classify_biz_code(471, "")[0] == "risk"
+              and classify_biz_code(300011, "账号异常")[0] == "risk"
+              and classify_biz_code(-1, "请求频繁")[0] == "risk"
+              and classify_http_status(461, False)[0] == "risk")
+
+        from fastapi.testclient import TestClient
+        from monitor.app import app
+        os.environ["CORTECH_ENABLE_COOKIE_HANDSHAKE"] = "1"
+        os.environ["CORTECH_SAAS"] = "1"
+        os.environ["CORTECH_SKIP_BROWSER_SCAN"] = "1"
+        http_email = f"guard-http-{int(time.time())}@example.com"
+        http_secret = "httpStagedA1Value99"
+        with TestClient(app) as client:
+            reg = client.post("/api/auth/register", json={"email": http_email, "password": "secret1"})
+            check("保护测试用户可注册", reg.status_code == 200, reg.text[:120])
+            csrf = client.get("/api/auth/csrf")
+            token = (csrf.json() or {}).get("csrf_token") if csrf.status_code == 200 else ""
+            listed_before = client.get("/api/accounts")
+            n_before = len((listed_before.json() or {}).get("items") or [])
+            staged_http = client.post(
+                "/api/accounts/cookie-handshake",
+                headers={"X-CSRF-Token": token},
+                json={"a1": http_secret, "web_session": "httpStagedWebValue99",
+                      "nickname": "网页候选", "confirm": True, "enable": False,
+                      "cookies": {"a1": http_secret, "web_session": "httpStagedWebValue99"}},
+            )
+            body = staged_http.json() if staged_http.headers.get("content-type", "").startswith("application/json") else {}
+            listed_mid = client.get("/api/accounts")
+            avail = client.get("/api/accounts/browser-available")
+            avail_text = avail.text
+            check("插件握手只暂存候选",
+                  staged_http.status_code == 200 and body.get("staged") is True
+                  and body.get("auto_imported") is False
+                  and http_secret not in staged_http.text
+                  and len((listed_mid.json() or {}).get("items") or []) == n_before
+                  and http_secret not in avail_text
+                  and any((item.get("nickname") == "网页候选") for item in (avail.json() or {}).get("items") or []))
+            bare = client.post("/api/accounts/browser-import", json={"key": body.get("key") or "x"})
+            check("接口未带确认不会导入", bare.status_code == 400 and "不会" in bare.text)
+            done = client.post("/api/accounts/browser-import",
+                               json={"key": body.get("key"), "confirm": True})
+            done_body = done.json() if done.status_code == 200 else {}
+            if done_body.get("id"):
+                guard_ids.append(done_body["id"])
+            listed = client.get("/api/accounts")
+            row = next((i for i in (listed.json() or {}).get("items") or []
+                        if i.get("id") == done_body.get("id")), {})
+            check("确认导入后账号带保护状态",
+                  done.status_code == 200 and row.get("enabled") == 1
+                  and (row.get("protection") or {}).get("readonly_collection") is True
+                  and http_secret not in listed.text)
+            off = client.post(f"/api/accounts/{done_body.get('id')}/enabled", json={"enabled": False})
+            check("接口可停用账号",
+                  off.status_code == 200 and off.json().get("enabled") == 0
+                  and "停用" in (off.json().get("protection_message") or ""))
+    finally:
+        os.environ.pop("CORTECH_BROWSER_CDP", None)
+        os.environ.pop("CORTECH_LOGIN_WARMUP_SEC", None)
+        os.environ.pop("CORTECH_QUIET_HOURS", None)
+        os.environ.pop("CORTECH_RAMP_SEC", None)
+        os.environ.pop("CORTECH_ENABLE_COOKIE_HANDSHAKE", None)
+        os.environ.pop("CORTECH_SAAS", None)
+        os.environ.pop("CORTECH_SKIP_BROWSER_SCAN", None)
+        set_launch_browser(True)
+        with db._connect() as conn:
+            for gid in guard_ids:
+                conn.execute("DELETE FROM xhs_accounts WHERE id=?", (gid,))
+            if detected_id:
+                conn.execute("DELETE FROM xhs_detected_logins WHERE id=?", (detected_id,))
+            conn.execute("DELETE FROM xhs_detected_logins WHERE nickname IN ('未选择的插件登录','网页候选')")
+            conn.execute("DELETE FROM auth_sessions WHERE user_id IN (SELECT id FROM users WHERE email LIKE 'guard-http-%')")
+            conn.execute("DELETE FROM users WHERE email LIKE 'guard-http-%'")
+        shutil.rmtree(profile_root, ignore_errors=True)
+        shutil.rmtree(v20_root, ignore_errors=True)
 
     # ---- 汇总 ----
     fails = [n for n, ok in results if not ok]

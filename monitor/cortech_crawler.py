@@ -265,6 +265,11 @@ class XHSClient:
                        payload: Optional[Dict] = None,
                        on_detail: bool = False) -> Dict:
         """签名请求。详情接口上的 404 / code=-3 记为删除，不按采集失败重试。"""
+        from .account_guard import ReadOnlyViolation, assert_readonly_endpoint
+        try:
+            assert_readonly_endpoint(method, uri)
+        except ReadOnlyViolation as exc:
+            raise CortechCrawlerFailed(str(exc)) from exc
         url = _DOMAIN + uri
         for attempt in range(3):
             try:
@@ -293,7 +298,7 @@ class XHSClient:
             except _xhs.DataFetchError:
                 if attempt == 2:
                     raise
-                await asyncio.sleep(1)
+                await asyncio.sleep(2)
             except Exception as e:
                 if attempt == 2:
                     raise _xhs.DataFetchError(str(e))
@@ -345,9 +350,11 @@ class XHSClient:
         })
 
     async def get_creator_info(self, user_id: str) -> Dict:
-        """作者信息（来自 spider_xhs.py 的作者补采思路，用 direct API 实现，无需 Node.js）"""
+        """作者公开资料。只读，不写关注或互动。"""
         try:
-            return await self._request("GET", "/api/sns/web/v1/user/selfinfo", params={})
+            return await self._request(
+                "GET", "/api/sns/web/v1/user/otherinfo",
+                params={"target_user_id": user_id})
         except Exception:
             return {}
 
@@ -503,7 +510,8 @@ class CortechCrawler:
         if "web_session" not in cookie_dict or "a1" not in cookie_dict:
             raise CortechCrawlerFailed("登录失效（Cookie 缺少 a1/web_session），请重新扫码")
 
-        headers = dict(_BASE_HEADERS)
+        from .account_guard import apply_fingerprint_headers
+        headers = apply_fingerprint_headers(dict(_BASE_HEADERS), ctx.account_id)
         headers["Cookie"] = cookie_str
         client = XHSClient(headers=headers, cookie_dict=cookie_dict)
         ctx.log("[cortech] 登录态就绪，开始采集")
@@ -542,6 +550,11 @@ class CortechCrawler:
             ctx.log(f"[cortech] 详情采集失败并跳过 {result.detail_skipped} 条（不是删除）")
         return result
 
+    async def _pace(self, ctx: CrawlContext, fallback: float) -> None:
+        from .account_guard import next_delay
+        await asyncio.sleep(next_delay(
+            ctx.account_id, aggressive=bool(ctx.aggressive), fallback=fallback))
+
     async def _crawl_keyword(self, client: XHSClient, ctx: CrawlContext,
                              keyword: str, notes: List[NoteData],
                              comments: List[CommentData],
@@ -575,7 +588,7 @@ class CortechCrawler:
             if not res.get("has_more"):
                 break
             page += 1
-            await asyncio.sleep(interval)
+            await self._pace(ctx, interval)
 
     async def _fetch_note(self, client: XHSClient, ctx: CrawlContext,
                           item: Dict, keyword: str,
@@ -602,7 +615,7 @@ class CortechCrawler:
             reason = "详情为空，按已删除或不可浏览处理（HTTP/业务 404 一类）"
             ctx.log(f"[cortech] {reason} {post_id}")
             return _deleted_note(post_id, xsec_token, xsec_source, keyword, reason)
-        await asyncio.sleep(interval)
+        await self._pace(ctx, interval)
         note = _map_note(card, post_id, xsec_token, xsec_source, keyword)
         # 作者信息补采（来自 spider_xhs.py 的思路）
         await self._enrich_author(client, note)
@@ -655,13 +668,13 @@ class CortechCrawler:
                             sd = _map_comment(sc, note.post_id)
                             if sd:
                                 comments.append(sd)
-                        await asyncio.sleep(interval)
+                        await self._pace(ctx, interval)
                     except (_xhs.DataFetchError, _xhs.NoteNotFoundError):
                         continue
                 if not res.get("has_more"):
                     break
                 cursor = res.get("cursor", "")
-                await asyncio.sleep(interval)
+                await self._pace(ctx, interval)
         except (_xhs.PlatformAccessError, _xhs.IPBlockError):
             raise
         except _xhs.DataFetchError as e:
@@ -679,19 +692,28 @@ class CortechCrawler:
             raise RuntimeError("playwright 未安装，无法降级到浏览器模式")
 
         notes: List[NoteData] = []
+        from .account_guard import (
+            fingerprint_for, launch_persistent_context, persistent_profile_dir,
+            profile_dir_has_session,
+        )
         async with async_playwright() as pw:
-            browser = await pw.chromium.launch(
-                headless=True,
-                args=["--no-sandbox", "--disable-blink-features=AutomationControlled"])
+            if ctx.account_id:
+                udd = persistent_profile_dir(ctx.account_id)
+                fp = fingerprint_for(ctx.account_id)
+                if not (udd / "storage_state.json").is_file():
+                    from .login_flow import decrypt_profile_to_dir
+                    decrypt_profile_to_dir(ctx.account_id, udd)
+            else:
+                udd = active_login_cache_dir()
+                fp = fingerprint_for(None)
+            storage = None
+            state_file = udd / "storage_state.json"
+            if state_file.is_file() and not profile_dir_has_session(udd):
+                storage = json.loads(state_file.read_text(encoding="utf-8"))
+            context = await launch_persistent_context(
+                pw, udd, fingerprint=fp, storage_state=storage, headless=True)
             try:
-                cache = active_login_cache_dir()
-                state_file = cache / "storage_state.json"
-                if state_file.exists():
-                    context = await browser.new_context(
-                        storage_state=json.loads(state_file.read_text(encoding="utf-8")))
-                else:
-                    context = await browser.new_context()
-                page = await context.new_page()
+                page = context.pages[0] if context.pages else await context.new_page()
                 for kw in ctx.keywords:
                     if ctx.should_stop() or len(notes) >= ctx.max_notes:
                         break
@@ -719,9 +741,8 @@ class CortechCrawler:
                             source_keyword=kw,
                         ))
                     ctx.report_progress(50, f"浏览器模式已采集 {len(notes)} 条")
-                await context.close()
             finally:
-                await browser.close()
+                await context.close()
         ctx.log(f"[cortech-browser] 降级采集完成：{len(notes)} 条（仅标题+链接，详情需 direct-API）")
         return CrawlResult(notes=notes, comments=[])
 
@@ -752,6 +773,10 @@ def crawl_with_fallback(ctx: CrawlContext) -> Tuple[CrawlResult, str]:
     try:
         return crawl(ctx), "direct"
     except CortechCrawlerFailed as e:
+        from .xhs_errors import failure_kind_from_message
+        if failure_kind_from_message(str(e)) == "risk":
+            ctx.log(f"[cortech] 风控，不降级重试：{e}")
+            raise
         ctx.log(f"[cortech] direct-API 失败：{e}")
         ctx.log("[cortech] 自动降级到浏览器模式…")
         return asyncio.run(_crawler.crawl_browser_fallback(ctx)), "browser"

@@ -127,6 +127,29 @@ def _resolve_account(account_id: Optional[int], xhs_user_id: str) -> Optional[Di
     return None
 
 
+def stage_user_cookies(a1: str = "", web_session: str = "", nickname: str = "",
+                       xhs_user_id: str = "",
+                       extra_cookies: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """插件确认发送后只进入候选。不创建账号，采集轮换看不到。"""
+    _require_enabled()
+    cookies = _collect_cookies(a1, web_session, extra_cookies)
+    from .browser_import import stage_detected_login
+    try:
+        staged = stage_detected_login(
+            source="extension",
+            browser="浏览器插件",
+            profile="当前浏览器",
+            nickname=(nickname or "").strip()[:40],
+            region="www.xiaohongshu.com",
+            cookies=cookies,
+        )
+    finally:
+        cookies.clear()
+    staged["xhs_user_id"] = (xhs_user_id or "").strip()[:64]
+    staged["account_id"] = None
+    return staged
+
+
 def accept_user_cookies(a1: str = "", web_session: str = "", nickname: str = "",
                         account_id: Optional[int] = None, xhs_user_id: str = "",
                         extra_cookies: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -160,6 +183,8 @@ def accept_user_cookies(a1: str = "", web_session: str = "", nickname: str = "",
         "check_note": health["message"][:180],
     })
     if health.get("ok"):
+        from .account_guard import arm_fresh_login, default_fingerprint
+        arm_fresh_login(account_id, default_fingerprint())
         if created:
             message = (
                 f"已加密保存你本人提交的登录态，并完成健康检查。账号「{display}」可以参加采集。"

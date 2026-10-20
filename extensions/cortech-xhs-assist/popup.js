@@ -122,6 +122,8 @@ async function sendCookies() {
       nickname: state.nickname || "",
       xhs_user_id: state.xhsUserId || "",
       cookies: jar,
+      confirm: true,
+      enable: false,
     };
     const res = await fetch(state.origin + "/api/accounts/cookie-handshake", {
       method: "POST",
