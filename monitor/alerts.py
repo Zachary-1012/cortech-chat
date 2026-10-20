@@ -277,10 +277,23 @@ def _row_to_rule(row: sqlite3.Row) -> Dict[str, Any]:
 
 def list_rules() -> List[Dict[str, Any]]:
     init_db()
+    uid = current_user_id()
     where, params = [], []
     apply_uid_filter(where, params)
     clause = f"WHERE {' AND '.join(where)}" if where else ""
     with _lock, _connect() as conn:
+        if uid is not None:
+            owned = conn.execute(
+                "SELECT COUNT(*) c FROM alert_rules WHERE user_id=?", (uid,)).fetchone()["c"]
+            if owned == 0:
+                now = int(time.time())
+                for r in DEFAULT_RULES:
+                    conn.execute(
+                        "INSERT INTO alert_rules(user_id,name,kind,enabled,level,params_json,"
+                        "created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)",
+                        (uid, r["name"], r["kind"], 1, r["level"],
+                         json.dumps(r["params"], ensure_ascii=False), now, now),
+                    )
         rows = conn.execute(f"SELECT * FROM alert_rules {clause} ORDER BY id", params).fetchall()
     return [_row_to_rule(r) for r in rows]
 
@@ -338,10 +351,12 @@ def delete_rule(rule_id: int) -> bool:
 
 def set_rule_enabled(rule_id: int, enabled: bool) -> bool:
     init_db()
+    where, params = ["id=?"], [rule_id]
+    apply_uid_filter(where, params)
     with _lock, _connect() as conn:
         cur = conn.execute(
-            "UPDATE alert_rules SET enabled=?,updated_at=? WHERE id=?",
-            (1 if enabled else 0, int(time.time()), rule_id),
+            f"UPDATE alert_rules SET enabled=?,updated_at=? WHERE {' AND '.join(where)}",
+            (1 if enabled else 0, int(time.time()), *params),
         )
     return cur.rowcount > 0
 
@@ -400,11 +415,15 @@ def get_alert(alert_id: int) -> Optional[Dict[str, Any]]:
         notes = []
         if post_ids:
             ph = ",".join("?" for _ in post_ids)
+            note_sql, note_params = "", ()
+            uid = current_user_id()
+            if uid is not None:
+                note_sql, note_params = " AND user_id=?", (uid,)
             nrows = conn.execute(
                 f"SELECT post_id,title,author,liked_count,collected_count,"
                 f"comment_count,share_count,sentiment,note_url,publish_time,post_status"
-                f" FROM notes WHERE post_id IN ({ph})",
-                post_ids,
+                f" FROM notes WHERE post_id IN ({ph}){note_sql}",
+                (*post_ids, *note_params),
             ).fetchall()
             notes = [dict(n) for n in nrows]
         alert["notes"] = notes
@@ -417,17 +436,24 @@ def get_alert(alert_id: int) -> Optional[Dict[str, Any]]:
 
 
 def set_alert_status(alert_id: int, status: str) -> bool:
+    if status not in ("unread", "read", "handled", "ignored"):
+        raise ValueError(f"未知状态: {status}")
     if get_alert(alert_id) is None:
         return False
-    if status not in ("unread", "read", "handled"):
-        raise ValueError(f"未知状态: {status}")
     init_db()
+    where, params = ["id=?"], [alert_id]
+    apply_uid_filter(where, params)
     with _lock, _connect() as conn:
         cur = conn.execute(
-            "UPDATE alerts SET status=?,updated_at=? WHERE id=?",
-            (status, int(time.time()), alert_id),
+            f"UPDATE alerts SET status=?,updated_at=? WHERE {' AND '.join(where)}",
+            (status, int(time.time()), *params),
         )
     return cur.rowcount > 0
+
+
+def mark_read(alert_id: int) -> bool:
+    """把一条预警标为已读。无权或不存在时返回 False。"""
+    return set_alert_status(alert_id, "read")
 
 
 def unread_count() -> int:
@@ -457,21 +483,46 @@ def _create_alert(conn: sqlite3.Connection, rule: Dict[str, Any], level: str,
 
 
 def create_alert(level: str, title: str, message: str,
-                 topic_id: Optional[int] = None) -> int:
-    """系统告警（无规则，如签名漂移检测）。level: critical/high/medium。"""
+                 topic_id: Optional[int] = None,
+                 post_ids: Optional[List[str]] = None,
+                 link: str = "") -> int:
+    """系统或手工告警。post_ids 与帖子 post_id 对齐，列表和详情原样返回。"""
     init_db()
-    import time as _time
-    now = int(_time.time())
+    now = int(time.time())
+    ids = [str(p).strip() for p in (post_ids or []) if str(p).strip()]
+    uid = current_user_id()
     with _lock, _connect() as conn:
-        # 系统规则占位（rule_id=0）
         cur = conn.execute(
-            "INSERT INTO alerts(rule_id,rule_name,level,title,summary,topic_id,"
+            "INSERT INTO alerts(user_id,rule_id,rule_name,level,title,summary,topic_id,"
             "topic_name,task_id,post_ids_json,link,status,created_at,updated_at)"
-            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (0, "系统", level, title, message, topic_id, "",
-             None, "[]", "", "unread", now, now))
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (uid, 0, "系统", level, title, message, topic_id, "",
+             None, json.dumps(ids, ensure_ascii=False), link or "",
+             "unread", now, now))
         conn.commit()
         return cur.lastrowid
+
+
+def export_alerts_csv(status: Optional[str] = None,
+                      level: Optional[str] = None) -> Tuple[str, str]:
+    """导出当前用户的预警。文件含 post_ids 列。"""
+    import csv
+    import datetime as _dt
+    import io
+    data = list_alerts(status=status, level=level, limit=2000, offset=0)
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(["id", "level", "title", "summary", "status",
+                     "topic_id", "post_ids", "created_at"])
+    for item in data["items"]:
+        writer.writerow([
+            item.get("id"), item.get("level"), item.get("title"),
+            item.get("summary"), item.get("status"), item.get("topic_id"),
+            ";".join(item.get("post_ids") or []),
+            item.get("created_at"),
+        ])
+    fname = "CortechChat_预警_" + _dt.datetime.now().strftime("%Y%m%d_%H%M%S") + ".csv"
+    return fname, "\ufeff" + buf.getvalue()
 
 
 # ---------------- 规则引擎 ----------------
@@ -479,12 +530,15 @@ def create_alert(level: str, title: str, message: str,
 def _task_window_notes(conn: sqlite3.Connection, topic_id: int,
                        start_ts: int, end_ts: int) -> List[Dict[str, Any]]:
     """本轮采集入库的帖子（按采集时间落在任务窗口内）。"""
-    rows = conn.execute(
-        "SELECT post_id,title,desc,author,liked_count,collected_count,"
-        "comment_count,share_count,sentiment,note_url,publish_time,collected_at"
-        " FROM notes WHERE topic_id=? AND collected_at>=? AND collected_at<=?",
-        (topic_id, start_ts, end_ts),
-    ).fetchall()
+    sql = ("SELECT post_id,title,desc,author,liked_count,collected_count,"
+           "comment_count,share_count,sentiment,note_url,publish_time,collected_at"
+           " FROM notes WHERE topic_id=? AND collected_at>=? AND collected_at<=?")
+    params: List[Any] = [topic_id, start_ts, end_ts]
+    uid = current_user_id()
+    if uid is not None:
+        sql += " AND user_id=?"
+        params.append(uid)
+    rows = conn.execute(sql, params).fetchall()
     return [dict(r) for r in rows]
 
 
@@ -492,12 +546,14 @@ def _baseline_daily_avg(conn: sqlite3.Connection, topic_id: int,
                         days: int) -> float:
     """基线：过去 N 天按发布时间的日均负面帖子数（无数据按 0 计）。"""
     since = int(time.time()) - days * 86400
-    rows = conn.execute(
-        "SELECT CAST(publish_time/86400 AS INTEGER) d, COUNT(*) c FROM notes"
-        " WHERE topic_id=? AND sentiment='negative' AND publish_time>=?"
-        " GROUP BY d",
-        (topic_id, since),
-    ).fetchall()
+    sql = ("SELECT CAST(publish_time/86400 AS INTEGER) d, COUNT(*) c FROM notes"
+           " WHERE topic_id=? AND sentiment='negative' AND publish_time>=?")
+    params: List[Any] = [topic_id, since]
+    uid = current_user_id()
+    if uid is not None:
+        sql += " AND user_id=?"
+        params.append(uid)
+    rows = conn.execute(sql + " GROUP BY d", params).fetchall()
     total = sum(r["c"] for r in rows)
     return total / days if days else 0.0
 
@@ -778,7 +834,7 @@ def _alert_markdown(alert: Dict[str, Any]) -> str:
     ]
     if alert.get("link"):
         lines.append(f"[查看原帖]({alert['link']})")
-    lines.append("请登录 Chat Cortech 预警中心查看详情。")
+    lines.append("请登录 Cortech Chat 预警中心查看详情。")
     return "\n".join(lines)
 
 

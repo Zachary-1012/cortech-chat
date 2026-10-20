@@ -1,0 +1,11 @@
+.git
+.venv
+venv
+libs
+data
+**/__pycache__
+**/*.pyc
+**/.env
+monitor/.env
+deploy/env.production
+*.log

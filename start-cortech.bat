@@ -1,10 +1,10 @@
 @echo off
 chcp 65001 >nul
 cd /d "%~dp0"
-title Chat Cortech
+title Cortech Chat
 
 echo.
-echo   Chat Cortech · 正在启动桌面客户端...
+echo   Cortech Chat · 正在启动桌面客户端...
 echo.
 
 rem 首次运行：仓库不含离线依赖 libs/（约 250MB，不入库），此处一次性自动安装

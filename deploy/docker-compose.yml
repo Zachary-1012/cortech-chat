@@ -1,0 +1,29 @@
+# Cortech Chat 生产编排。数据卷在镜像外面。
+# 用法见 deploy/README.md
+services:
+  cortech-chat:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    image: cortech-chat:local
+    environment:
+      CORTECH_SAAS: "1"
+      CORTECH_DATA_DIR: /var/lib/cortech
+      CORTECH_HOST: 0.0.0.0
+      CORTECH_PORT: "8000"
+      # 证书在 nginx 终结时再打开，直连 http 保持关闭
+      CORTECH_COOKIE_SECURE: "0"
+    ports:
+      - "127.0.0.1:8000:8000"
+    volumes:
+      - cortech_data:/var/lib/cortech
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+volumes:
+  cortech_data:

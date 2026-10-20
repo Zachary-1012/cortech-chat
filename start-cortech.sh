@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Chat Cortech · Linux / macOS 启动脚本（需 Python 3.10+）
+# Cortech Chat · Linux / macOS 启动脚本（需 Python 3.10+）
 # 用法：./start-cortech.sh
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -36,6 +36,6 @@ if curl -fsS -m 2 "http://$HOST:$PORT/api/auth/status" >/dev/null 2>&1; then
   exit 0
 fi
 
-echo "Chat Cortech 启动中… 访问 http://$HOST:$PORT"
+echo "Cortech Chat 启动中… 访问 http://$HOST:$PORT"
 echo "（按 Ctrl+C 停止）"
 exec "$PY" -m monitor.app

@@ -14,6 +14,7 @@ import time
 from typing import Any, Dict, List, Optional
 
 from . import config
+from .db import apply_uid_filter, current_user_id, uid_sql
 
 logger = logging.getLogger(__name__)
 
@@ -75,6 +76,7 @@ def list_influencers(q: Optional[str] = None,
     """达人列表，支持搜索、领域、合作状态、粉丝量筛选。"""
     _ensure_columns()
     where, params = ["fans_count >= ?"], [int(min_fans)]
+    apply_uid_filter(where, params)
     if q:
         where.append("(nickname LIKE ? OR author_id LIKE ? OR xiaohongshu_id LIKE ?)")
         params += [f"%{q}%"] * 3
@@ -118,10 +120,12 @@ def list_influencers(q: Optional[str] = None,
 def get_influencer(author_id: str) -> Optional[Dict[str, Any]]:
     _ensure_columns()
     with _connect() as conn:
+        extra, extra_p = uid_sql()
         r = conn.execute(
             "SELECT author_id, nickname, fans_count, liked_count, notes_count,"
             " ip_location, domain_tags, coop_status, coop_notes, xiaohongshu_id,"
-            " updated_at FROM authors WHERE author_id=?", (author_id,)).fetchone()
+            " updated_at FROM authors WHERE author_id=?" + extra,
+            (author_id, *extra_p)).fetchone()
         if not r:
             return None
         d = dict(r)
@@ -148,11 +152,12 @@ def add_influencer(data: Dict[str, Any]) -> Dict[str, Any]:
     now = int(time.time())
     with _connect() as conn:
         conn.execute(
-            "INSERT OR REPLACE INTO authors (author_id, nickname, fans_count,"
+            "INSERT OR REPLACE INTO authors (user_id, author_id, nickname, fans_count,"
             " liked_count, notes_count, ip_location, domain_tags, coop_status,"
             " coop_notes, xiaohongshu_id, updated_at)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-            (author_id, data.get("nickname") or "", int(data.get("fans_count") or 0),
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            (current_user_id(), author_id, data.get("nickname") or "",
+             int(data.get("fans_count") or 0),
              int(data.get("liked_count") or 0), int(data.get("notes_count") or 0),
              data.get("ip_location") or "", _json.dumps(tags, ensure_ascii=False),
              data.get("coop_status") or "none", data.get("coop_notes") or "",
@@ -187,8 +192,11 @@ def update_influencer(author_id: str, data: Dict[str, Any]) -> Optional[Dict[str
     sets.append("updated_at=?")
     params.append(int(time.time()))
     params.append(author_id)
+    extra, extra_p = uid_sql()
     with _connect() as conn:
-        cur = conn.execute(f"UPDATE authors SET {', '.join(sets)} WHERE author_id=?", params)
+        cur = conn.execute(
+            f"UPDATE authors SET {', '.join(sets)} WHERE author_id=?{extra}",
+            (*params, *extra_p))
         conn.commit()
         if cur.rowcount == 0:
             return None
@@ -197,8 +205,10 @@ def update_influencer(author_id: str, data: Dict[str, Any]) -> Optional[Dict[str
 
 def delete_influencer(author_id: str) -> bool:
     _ensure_columns()
+    extra, extra_p = uid_sql()
     with _connect() as conn:
-        cur = conn.execute("DELETE FROM authors WHERE author_id=?", (author_id,))
+        cur = conn.execute(
+            f"DELETE FROM authors WHERE author_id=?{extra}", (author_id, *extra_p))
         conn.commit()
         return cur.rowcount > 0
 
@@ -209,8 +219,10 @@ def domain_stats() -> List[Dict[str, Any]]:
     import json as _json
     from collections import Counter
     c: Counter = Counter()
+    extra, extra_p = uid_sql()
     with _connect() as conn:
-        for r in conn.execute("SELECT domain_tags FROM authors").fetchall():
+        for r in conn.execute(
+                f"SELECT domain_tags FROM authors WHERE 1=1{extra}", extra_p).fetchall():
             try:
                 for t in _json.loads(r["domain_tags"] or "[]"):
                     c[t] += 1
@@ -236,11 +248,12 @@ def similar_influencers(author_id: str, limit: int = 10) -> List[Dict[str, Any]]
     import math
     scored = []
     with _connect() as conn:
+        extra, extra_p = uid_sql()
         rows = conn.execute(
             "SELECT author_id, nickname, fans_count, liked_count, notes_count,"
             " ip_location, domain_tags, coop_status, coop_notes, xiaohongshu_id,"
-            " updated_at FROM authors WHERE author_id != ?",
-            (author_id,)).fetchall()
+            " updated_at FROM authors WHERE author_id != ?" + extra,
+            (author_id, *extra_p)).fetchall()
         for r in rows:
             d = dict(r)
             try:

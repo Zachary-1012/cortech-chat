@@ -45,7 +45,48 @@ def _check_auth() -> Dict[str, Any]:
             "detail": "bcrypt 可用，邮箱注册与 session 登录已启用"}
 
 
-def _check_xhs(user_id: Optional[int]) -> Dict[str, Any]:
+def _tenant_snapshot(user_id: Optional[int]) -> Dict[str, Any]:
+    """当前租户的账号、话题、最近一次采集。未登录时不跨租户汇总。"""
+    empty = {
+        "accounts": [],
+        "xhs_accounts_healthy": 0,
+        "has_topic": False,
+        "topic_count": 0,
+        "last_crawl": None,
+    }
+    if user_id is None:
+        return empty
+    db.set_current_user(user_id)
+    try:
+        accounts = db.list_accounts()
+        topics = db.list_topics()
+        tasks = db.list_tasks(limit=1)
+    finally:
+        db.set_current_user(None)
+    valid = [a for a in accounts if a.get("status") == "valid"]
+    last = None
+    if tasks:
+        t = tasks[0]
+        last = {
+            "task_id": t.get("id"),
+            "status": t.get("status") or "",
+            "progress": int(t.get("progress") or 0),
+            "progress_detail": t.get("progress_detail") or "",
+            "notes_count": int(t.get("notes_count") or 0),
+            "topic_id": t.get("topic_id"),
+            "started_at": t.get("started_at"),
+            "finished_at": t.get("finished_at"),
+        }
+    return {
+        "accounts": accounts,
+        "xhs_accounts_healthy": len(valid),
+        "has_topic": bool(topics),
+        "topic_count": len(topics),
+        "last_crawl": last,
+    }
+
+
+def _check_xhs(user_id: Optional[int], accounts: List[Dict[str, Any]]) -> Dict[str, Any]:
     if user_id is None:
         return {
             "id": "xhs_account",
@@ -53,12 +94,8 @@ def _check_xhs(user_id: Optional[int]) -> Dict[str, Any]:
             "label": "小红书采集账号",
             "detail": "尚未登录 Cortech Chat。注册后请在「账号管理」用本人小红书账号扫码。",
             "code": "need_login",
+            "valid_count": 0,
         }
-    db.set_current_user(user_id)
-    try:
-        accounts = db.list_accounts()
-    finally:
-        db.set_current_user(None)
     valid = [a for a in accounts if a.get("status") == "valid"]
     if valid:
         names = "、".join((a.get("nickname") or f"账号{a['id']}") for a in valid[:3])
@@ -88,12 +125,44 @@ def _check_xhs(user_id: Optional[int]) -> Dict[str, Any]:
     }
 
 
+def _check_topic(snap: Dict[str, Any], user_id: Optional[int]) -> Dict[str, Any]:
+    if user_id is None:
+        return {"id": "topic", "ok": False, "label": "至少一个话题",
+                "detail": "登录后可查看本账号是否已创建话题。"}
+    if snap["has_topic"]:
+        return {"id": "topic", "ok": True, "label": "至少一个话题",
+                "detail": f"已有 {snap['topic_count']} 个话题"}
+    return {"id": "topic", "ok": False, "label": "至少一个话题",
+            "detail": "还没有话题。请先在「话题管理」创建一个再采集。"}
+
+
+def _check_last_crawl(snap: Dict[str, Any], user_id: Optional[int]) -> Dict[str, Any]:
+    if user_id is None:
+        return {"id": "last_crawl", "ok": False, "label": "最近一次采集",
+                "detail": "登录后可查看本账号最近一次采集状态。"}
+    last = snap.get("last_crawl")
+    if not last:
+        return {"id": "last_crawl", "ok": False, "label": "最近一次采集",
+                "detail": "还没有采集任务。真实采集需要本人小红书登录态；"
+                          "本地闭环可设 CORTECH_COLLECTION_FIXTURE=1。"}
+    ok = last.get("status") == "done"
+    detail = (f"任务 {last.get('task_id')} 状态 {last.get('status')}，"
+              f"进度 {last.get('progress')}%，入库 {last.get('notes_count')} 条")
+    if last.get("progress_detail"):
+        detail += f"（{last['progress_detail']}）"
+    return {"id": "last_crawl", "ok": ok, "label": "最近一次采集", "detail": detail}
+
+
 def build_setup_status(user_id: Optional[int] = None) -> Dict[str, Any]:
+    snap = _tenant_snapshot(user_id)
+    auth = _check_auth()
     checks: List[Dict[str, Any]] = [
         _check_db(),
         _check_data_dir(),
-        _check_auth(),
-        _check_xhs(user_id),
+        auth,
+        _check_xhs(user_id, snap["accounts"]),
+        _check_topic(snap, user_id),
+        _check_last_crawl(snap, user_id),
     ]
     by_id = {c["id"]: c for c in checks}
     service_ready = all(by_id[k]["ok"] for k in ("db", "data_dir", "auth"))
@@ -113,6 +182,11 @@ def build_setup_status(user_id: Optional[int] = None) -> Dict[str, Any]:
         "mode": "saas",
         "ready": service_ready and bool(by_id["xhs_account"]["ok"]),
         "service_ready": service_ready,
+        "auth_ready": bool(auth["ok"]),
+        "xhs_accounts_healthy": int(snap["xhs_accounts_healthy"]),
+        "has_topic": bool(snap["has_topic"]),
+        "topic_count": int(snap["topic_count"]),
+        "last_crawl": snap["last_crawl"],
         "collection_ready": collection_ready,
         "data_dir": str(DATA_DIR),
         "host": bind_host(),

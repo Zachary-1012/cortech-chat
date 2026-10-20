@@ -9,7 +9,7 @@ from __future__ import annotations
 from typing import Dict, List, Optional
 
 # 产品信息
-PRODUCT_NAME = "Chat Cortech"
+PRODUCT_NAME = "Cortech Chat"
 PRODUCT_TAGLINE = "通用社媒运营 SaaS：舆情监控、内容创作、品牌保护，一站式搞定"
 
 # 功能清单（route 以前端路由为准）
