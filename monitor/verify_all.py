@@ -151,6 +151,191 @@ def main():
     with db._connect() as conn:
         conn.execute("DELETE FROM notes WHERE post_id LIKE 'fixture_%'")
 
+    # ---- 4c. 本人握手 / 轮换 v2 / 已登录浏览器会话 / 插件形态 ----
+    import json as _json
+    import shutil
+    import tempfile
+    from pathlib import Path as _Path
+    from monitor.account_crypto import decrypt_login_data, encrypt_login_data
+    from monitor.account_rotation import beijing_day, block_reason, eligible_accounts
+    from monitor.browser_use_worker import (BrowserUseRejected, can_use, reset_for_tests,
+                                           session_scope, status as bu_status)
+    from monitor.config import cookie_handshake_enabled
+    from monitor.cookie_handshake import (HandshakeDisabled, HandshakeRejected,
+                                          accept_user_cookies)
+
+    _flag_names = ("CORTECH_SAAS", "CORTECH_ENABLE_COOKIE_HANDSHAKE",
+                   "CORTECH_ENABLE_BROWSER_USE", "CORTECH_BROWSER_USE_PROFILE",
+                   "CORTECH_BROWSER_USE_CONCURRENCY", "CORTECH_BROWSER_USE_QUEUE")
+    _saved_flags = {key: os.environ.pop(key, None) for key in _flag_names}
+    good_id = bad_id = full_id = None
+    try:
+        check("本地默认关闭握手", cookie_handshake_enabled() is False)
+        os.environ["CORTECH_SAAS"] = "1"
+        check("SaaS 默认开启握手", cookie_handshake_enabled() is True)
+        os.environ["CORTECH_ENABLE_COOKIE_HANDSHAKE"] = "0"
+        check("显式 0 关闭握手", cookie_handshake_enabled() is False)
+        try:
+            accept_user_cookies(a1="12345678", web_session="12345678")
+            check("关闭时拒绝握手", False)
+        except HandshakeDisabled as e:
+            check("关闭时拒绝握手", "未开启" in str(e))
+        os.environ["CORTECH_ENABLE_COOKIE_HANDSHAKE"] = "1"
+        try:
+            accept_user_cookies(a1="short", web_session="also-short")
+            check("过短 Cookie 被拒绝", False)
+        except HandshakeRejected as e:
+            check("过短 Cookie 被拒绝", "a1" in str(e) and "short" not in str(e))
+
+        secret_a1 = "handshakeA1Value99"
+        secret_web = "handshakeWebSession99"
+        res = accept_user_cookies(
+            a1=secret_a1, web_session=secret_web, nickname="插件用户",
+            xhs_user_id="p1-xhs-user",
+            extra_cookies={"webId": "webidvalue99", "not_allowed": "nope"},
+        )
+        dumped = _json.dumps(res, ensure_ascii=False)
+        check("握手成功且中文说明",
+              res.get("ok") is True and "加密" in res.get("message", "")
+              and "健康检查" in res["message"])
+        check("握手响应不含 Cookie",
+              secret_a1 not in dumped and secret_web not in dumped and "webidvalue99" not in dumped)
+        good_id = res["account_id"]
+        plain = decrypt_login_data(db.get_account(good_id)["login_data_enc"])
+        names = {c["name"] for c in _json.loads(plain)["cookies"]}
+        check("握手加密入库且丢弃未知 Cookie",
+              {"a1", "web_session", "webId"} <= names and "not_allowed" not in names)
+        check("握手后健康检查为有效", db.get_account(good_id)["status"] == "valid")
+        res2 = accept_user_cookies(
+            a1=secret_a1, web_session=secret_web, nickname="插件用户",
+            xhs_user_id="p1-xhs-user")
+        same = [a["id"] for a in db.list_accounts() if a.get("xhs_user_id") == "p1-xhs-user"]
+        check("同一小红书用户更新而不是新建",
+              res2["updated"] is True and res2["account_id"] == good_id and same == [good_id])
+
+        email = f"p1-csrf-{int(time.time())}@example.com"
+        with db._lock, db._connect() as conn:
+            cur = conn.execute(
+                "INSERT INTO users (email, password_hash, created_at) VALUES (?,?,?)",
+                (email, "not-a-login", int(time.time())))
+            csrf_uid = cur.lastrowid
+        token = db.create_auth_session(csrf_uid)
+        csrf = db.issue_csrf(token)
+        check("CSRF 可签发并校验",
+              bool(csrf) and db.csrf_matches(token, csrf)
+              and not db.csrf_matches(token, "not-the-token"))
+        db.delete_user_sessions(csrf_uid)
+        with db._lock, db._connect() as conn:
+            conn.execute("DELETE FROM users WHERE id=?", (csrf_uid,))
+
+        bad_id = db.create_account("不健康")
+        db.update_account(bad_id, {"status": "valid"})
+        full_id = db.create_account("配额满")
+        db.update_account(full_id, {
+            "status": "valid",
+            "login_data_enc": encrypt_login_data(plain),
+            "daily_quota": 1,
+            "quota_used": 1,
+            "quota_day": beijing_day(),
+        })
+        eligible = {a["id"] for a in eligible_accounts()}
+        bad_reason = block_reason(db.get_account(bad_id))
+        full_reason = block_reason(db.get_account(full_id))
+        check("轮换跳过不健康和超配额",
+              good_id in eligible and bad_id not in eligible and full_id not in eligible
+              and bool(bad_reason) and "配额" in full_reason)
+
+        from monitor.adapters.base import AuthorData, NoteData
+        from monitor.ingester import store_unified
+        store_unified(tid, [NoteData(
+            post_id="p1_rot_note", title="轮换记录",
+            author=AuthorData(nickname="t"), publish_time=1700000000)],
+            [], account_id=good_id)
+        cols = db.list_note_collections("p1_rot_note")
+        with db._connect() as conn:
+            row = conn.execute(
+                "SELECT collected_account_id FROM notes WHERE post_id='p1_rot_note'"
+            ).fetchone()
+        check("记下采集账号",
+              bool(cols) and cols[0]["account_id"] == good_id
+              and row["collected_account_id"] == good_id)
+
+        os.environ["CORTECH_ENABLE_BROWSER_USE"] = "0"
+        reset_for_tests()
+        check("浏览器会话默认关闭", bu_status()["enabled"] is False and can_use() is False)
+        os.environ["CORTECH_ENABLE_BROWSER_USE"] = "1"
+        os.environ.pop("CORTECH_BROWSER_USE_PROFILE", None)
+        reset_for_tests()
+        check("未指定 profile 时拒绝", can_use() is False)
+        tmp = _Path(tempfile.mkdtemp(prefix="cortech_p1_profile_"))
+        (tmp / "storage_state.json").write_text(_json.dumps({
+            "cookies": [
+                {"name": "a1", "value": "profileA1Value99", "domain": ".xiaohongshu.com"},
+                {"name": "web_session", "value": "profileWeb99", "domain": ".xiaohongshu.com"},
+            ],
+            "origins": [],
+        }), encoding="utf-8")
+        os.environ["CORTECH_BROWSER_USE_PROFILE"] = str(tmp)
+        os.environ["CORTECH_BROWSER_USE_CONCURRENCY"] = "1"
+        os.environ["CORTECH_BROWSER_USE_QUEUE"] = "0"
+        reset_for_tests()
+        ready = bu_status()
+        check("已登录 profile 可用",
+              can_use() is True and ready["profile_ready"] is True
+              and "不会代为登录" in ready["message"]
+              and "profileA1Value99" not in _json.dumps(ready))
+        held = session_scope()
+        held_dir = held.__enter__()
+        second = None
+        try:
+            check("会话目录含 storage_state", (_Path(held_dir) / "storage_state.json").is_file())
+            try:
+                second = session_scope()
+                second.__enter__()
+                check("并发满且队列为 0 时拒绝", False)
+            except BrowserUseRejected:
+                check("并发满且队列为 0 时拒绝", True)
+                second = None
+        finally:
+            if second is not None:
+                second.__exit__(None, None, None)
+            held.__exit__(None, None, None)
+        shutil.rmtree(tmp, ignore_errors=True)
+
+        ext = _Path(__file__).resolve().parent.parent / "extensions" / "cortech-xhs-assist"
+        manifest = _json.loads((ext / "manifest.json").read_text(encoding="utf-8"))
+        popup_js = (ext / "popup.js").read_text(encoding="utf-8")
+        popup_html = (ext / "popup.html").read_text(encoding="utf-8")
+        check("插件为 MV3 且不注入页面",
+              manifest.get("manifest_version") == 3 and "content_scripts" not in manifest
+              and "xiaohongshu.hk" in _json.dumps(manifest)
+              and manifest.get("name", "").startswith("Cortech Chat"))
+        check("插件需确认后才发送且不后台监听",
+              "确认发送" in popup_html and "onChanged" not in popup_js
+              and "chrome.alarms" not in popup_js and "cortechOrigin" in popup_js)
+
+        import monitor.bid
+        import monitor.competitors
+        import monitor.creator
+        import monitor.fakecheck
+        import monitor.influencers
+        check("运营与营销模块仍在", all((
+            monitor.fakecheck, monitor.creator, monitor.bid,
+            monitor.competitors, monitor.influencers)))
+    finally:
+        for aid in (good_id, bad_id, full_id):
+            if aid:
+                db.delete_account(aid)
+        with db._connect() as conn:
+            conn.execute("DELETE FROM notes WHERE post_id='p1_rot_note'")
+            conn.execute("DELETE FROM note_collections WHERE post_id='p1_rot_note'")
+        for key, val in _saved_flags.items():
+            if val is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = val
+        reset_for_tests()
+
     static_html = ( __import__("pathlib").Path(__file__).resolve().parent / "static" / "index.html").read_text(encoding="utf-8")
     dist_api = ( __import__("pathlib").Path(__file__).resolve().parent.parent / "frontend" / "dist" / "assets" / "index-VG6IEY1v.js").read_text(encoding="utf-8")
     check("旧 /api/notes 已改到 /api/posts", "/api/notes" not in static_html and 'url:"/notes"' not in dist_api)

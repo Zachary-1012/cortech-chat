@@ -44,11 +44,40 @@ curl -s http://127.0.0.1:8000/api/setup/status
 | `CORTECH_DATA_DIR` | 数据目录（`TKH_DATA_DIR` 仍可作为别名） | 项目下 `data/` |
 | `CORTECH_HOST` | 监听地址（`XHS_HOST` 为旧名） | `0.0.0.0` |
 | `CORTECH_PORT` | 监听端口（`XHS_PORT` 为旧名） | `8000` |
+| `CORTECH_SAAS` | `1` 表示云上 SaaS。未单独设置握手开关时，**默认开启**本人 Cookie 握手 | 关 |
 | `CORTECH_COLLECTION_FIXTURE` | `1` 时写入本地样例，不访问小红书 | 关 |
-| `CORTECH_ENABLE_COOKIE_HANDSHAKE` | `1` 时允许用户主动提交本人 Cookie | 关 |
-| `CORTECH_ENABLE_BROWSER_USE` | `1` 时只承认你指定的本地 profile，不代登录 | 关 |
+| `CORTECH_ENABLE_COOKIE_HANDSHAKE` | `1` 开启 / `0` 关闭本人 Cookie 握手。未设置时跟随 `CORTECH_SAAS` | 跟随 SaaS |
+| `CORTECH_ENABLE_BROWSER_USE` | `1` 时才允许复用你已经登录的 profile。不代登录 | 关 |
+| `CORTECH_BROWSER_USE_PROFILE` | 你已经登录小红书的目录（含 `storage_state.json` 或浏览器 profile） | 空 |
+| `CORTECH_BROWSER_USE_CONCURRENCY` | 同时使用该会话的采集数 | `1` |
+| `CORTECH_BROWSER_USE_QUEUE` | 排队等待的上限 | `4` |
+| `CORTECH_ACCOUNT_DAILY_QUOTA` | 每个小红书账号每天计入的采集条数 | `300` |
+| `CORTECH_ACCOUNT_SKIP_SEC` | 登录失效后暂停轮换的秒数 | `1800` |
+
+云上建议同时设置：
+
+```bash
+export CORTECH_SAAS=1
+```
+
+这样本人 Cookie 握手默认开启。若要关掉，显式写 `CORTECH_ENABLE_COOKIE_HANDSHAKE=0`。
 
 域名接入仍可用「设置」里的站点配置生成 nginx 样例。证书和 DNS 需要你在域名服务商处完成。
+
+### 浏览器插件：把自己的小红书登录态发给 Cortech Chat
+
+仓库里有 Chrome / Edge MV3 扩展 `extensions/cortech-xhs-assist/`。它只在你点击并确认后，读取**你这个浏览器里已经登录**的小红书 Cookie，发给你已经登录的 Cortech Chat。不会在后台静默读取，也不会登录别人的账号。
+
+1. 打开 Chrome 或 Edge 的扩展管理页，打开「开发者模式」。
+2. 「加载已解压的扩展程序」，选中 `extensions/cortech-xhs-assist/`。
+3. 在插件里填写 Cortech Chat 地址（例如 `http://127.0.0.1:8000` 或你的 https 域名），点保存，并允许访问该地址。
+4. 用同一个浏览器先登录 Cortech Chat。服务器上需要握手可用：`CORTECH_SAAS=1`，或 `CORTECH_ENABLE_COOKIE_HANDSHAKE=1`。
+5. 在这个浏览器打开小红书并登录自己的号，再点插件里的「预览我的昵称」。确认昵称后勾选确认，才会发送。
+6. 发送成功后，页面上不再保留 Cookie。服务端加密保存，并立刻做登录态健康检查。
+
+大陆和香港访问小红书网页，通常都是 `www.xiaohongshu.com`，Cookie 域名是 `.xiaohongshu.com`。插件同时识别 `.xiaohongshu.cn` 和 `.xiaohongshu.hk`：只有当你的浏览器里确实有这些域名的登录 Cookie 时才会读取。应用商店上架以后再补，现在用「加载已解压的扩展程序」。
+
+可选：把你已经登录好的浏览器目录指给 `CORTECH_BROWSER_USE_PROFILE`，并设置 `CORTECH_ENABLE_BROWSER_USE=1`。采集会复用这份会话，排队和并发有上限。目录里没有 `a1` 和 `web_session` 时会拒绝，服务端不会代为登录。
 
 ### Windows（本地演示：桌面窗口）
 
@@ -62,7 +91,7 @@ curl -s http://127.0.0.1:8000/api/setup/status
    - 停止/排查：`stop-cortech.bat`，运行日志见 `data/desktop.log`。
 
 3. 首次运行会引导**注册账号**（本地版无需邮箱验证码）；首个注册用户自动继承内置示例数据。
-4. 可选：双击 `创建桌面快捷方式.bat`，在桌面生成带图标的 Chat Cortech 快捷方式。
+4. 可选：双击 `创建桌面快捷方式.bat`，在桌面生成带图标的 Cortech Chat 快捷方式。
 
 > 本机直接跑服务：`python -m monitor.app`（默认 `0.0.0.0:8000`），浏览器打开 <http://127.0.0.1:8000>。云上请改用上面的环境变量。
 
@@ -104,7 +133,7 @@ curl -s http://127.0.0.1:8000/api/setup/status
 | 17 | 设置 / 模型配置 | AI Provider 配置、域名绑定、采集账号管理 |
 
 **核心交互**：扫码登录小红书、从本地浏览器导入已登录账号（需用户二次确认，只显示昵称/头像，
-绝不暴露 cookie）、多账号管理与登录态健康检查。
+绝不暴露 cookie）、用浏览器插件确认后发送本人登录态、多账号按健康状态和每日配额轮换。
 
 ---
 

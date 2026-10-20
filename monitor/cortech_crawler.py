@@ -481,21 +481,27 @@ class CortechCrawler:
         if ctx.aggressive:
             ctx.log("[cortech] ⚠️ 强攻模式：请求间隔 0.4s、翻页上限 10，注意风控风险")
 
-        # 登录态（来自 direct_api.py）
+        # 登录态：优先用调用方已经准备好的 profile（浏览器会话工人），
+        # 否则解密指定账号。两条路都只读已有 Cookie，不在这里打开登录页。
         profile = None
-        if ctx.account_id:
+        cleanup = None
+        if ctx.profile_dir:
+            profile = Path(ctx.profile_dir)
+            ctx.log("[cortech] 使用你已经登录的浏览器会话，不会代为登录")
+        elif ctx.account_id:
             from .login_flow import decrypt_profile_to_dir
-            import tempfile, shutil
+            import tempfile
             tmpd = Path(tempfile.mkdtemp(prefix=f"xhs_acc_{ctx.account_id}_"))
+            cleanup = tmpd
             if decrypt_profile_to_dir(ctx.account_id, tmpd):
                 profile = tmpd
                 ctx.log(f"[cortech] 使用账号「{ctx.account_name}」的登录态")
         try:
             cookie_str, cookie_dict = await _read_login_cookies(profile)
         finally:
-            if profile:
+            if cleanup:
                 import shutil
-                shutil.rmtree(profile, ignore_errors=True)
+                shutil.rmtree(cleanup, ignore_errors=True)
         if "web_session" not in cookie_dict or "a1" not in cookie_dict:
             raise CortechCrawlerFailed("登录失效（Cookie 缺少 a1/web_session），请重新扫码")
 

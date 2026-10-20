@@ -225,7 +225,7 @@ class DynamicCORSMiddleware:
                         (b"access-control-allow-methods",
                          b"GET, POST, PUT, PATCH, DELETE, OPTIONS"),
                         (b"access-control-allow-headers",
-                         b"Authorization, Content-Type"),
+                         b"Authorization, Content-Type, X-CSRF-Token"),
                         (b"access-control-max-age", b"600"),
                         (b"vary", b"Origin"),
                     ],

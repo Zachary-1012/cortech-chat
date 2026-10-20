@@ -1,0 +1,21 @@
+{
+  "manifest_version": 3,
+  "name": "Cortech Chat 小红书助手",
+  "version": "1.0.0",
+  "description": "在你点击确认后，把你自己浏览器里已经登录的小红书会话发给你登录的 Cortech Chat。不会在后台静默读取，也不会登录别人的账号。",
+  "action": {
+    "default_title": "Cortech Chat 小红书助手",
+    "default_popup": "popup.html"
+  },
+  "permissions": ["cookies", "storage"],
+  "host_permissions": [
+    "https://*.xiaohongshu.com/*",
+    "https://xiaohongshu.com/*",
+    "https://*.xiaohongshu.cn/*",
+    "https://*.xiaohongshu.hk/*"
+  ],
+  "optional_host_permissions": [
+    "http://*/*",
+    "https://*/*"
+  ]
+}

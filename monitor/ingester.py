@@ -13,7 +13,7 @@ from __future__ import annotations
 import logging
 import time
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 from . import db
 from .adapters.base import CommentData, NoteData
@@ -24,8 +24,15 @@ logger = logging.getLogger("xhs-monitor.ingester")
 
 
 def store_unified(topic_id: int, notes: List[NoteData],
-                  comments: List[CommentData]) -> Tuple[int, int]:
-    """入库统一数据模型。返回 (新增帖子数, 新增评论数)。"""
+                  comments: List[CommentData],
+                  account_id: Optional[int] = None,
+                  task_id: Optional[int] = None,
+                  source: str = "account") -> Tuple[int, int]:
+    """入库统一数据模型。返回 (新增帖子数, 新增评论数)。
+
+    account_id / source 用来记下是哪个已保存账号或已登录浏览器会话采到的，
+    不写入 Cookie。
+    """
     now = int(time.time())  # 采集时间：入库瞬间打戳
     n_notes = n_comments = 0
     for n in notes:
@@ -53,8 +60,11 @@ def store_unified(topic_id: int, notes: List[NoteData],
             "note_url": n.note_url, "source_keyword": n.source_keyword,
             "sentiment": label, "sentiment_score": score,
             "collected_at": now,
+            "collected_account_id": account_id,
         }):
             n_notes += 1
+        db.record_note_collection(
+            n.post_id, topic_id, account_id, task_id=task_id, source=source)
         if n.author.author_id:
             db.upsert_author({
                 "author_id": n.author.author_id, "nickname": n.author.nickname,

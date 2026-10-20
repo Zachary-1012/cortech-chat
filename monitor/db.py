@@ -249,13 +249,32 @@ CREATE INDEX IF NOT EXISTS idx_notes_sentiment ON notes(sentiment);
 CREATE INDEX IF NOT EXISTS idx_notes_post_id ON notes(post_id);
 CREATE INDEX IF NOT EXISTS idx_notes_publish ON notes(publish_time);
 CREATE INDEX IF NOT EXISTS idx_comments_note ON comments(post_id);
+CREATE TABLE IF NOT EXISTS note_collections (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER,
+    post_id TEXT NOT NULL,
+    topic_id INTEGER,
+    account_id INTEGER,
+    task_id INTEGER,
+    source TEXT NOT NULL DEFAULT 'account',
+    collected_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_note_collections_post ON note_collections(user_id, post_id);
 """
 
 # 增量迁移：老库缺列时补列（表已存在时 CREATE TABLE 不生效）
 _MIGRATIONS = {
     "topics": {"engine": "TEXT NOT NULL DEFAULT 'cortech_browser'",
                "user_id": "INTEGER"},
-    "xhs_accounts": {"user_id": "INTEGER"},
+    "xhs_accounts": {
+        "user_id": "INTEGER",
+        "daily_quota": "INTEGER NOT NULL DEFAULT 0",
+        "quota_used": "INTEGER NOT NULL DEFAULT 0",
+        "quota_day": "TEXT NOT NULL DEFAULT ''",
+        "skip_until": "INTEGER NOT NULL DEFAULT 0",
+        "fail_streak": "INTEGER NOT NULL DEFAULT 0",
+    },
+    "auth_sessions": {"csrf_token": "TEXT NOT NULL DEFAULT ''"},
     "tasks": {"engine": "TEXT NOT NULL DEFAULT 'cortech_browser'",
               "engine_used": "TEXT DEFAULT ''",
               "task_type": "TEXT NOT NULL DEFAULT 'xhs'",
@@ -281,6 +300,7 @@ _MIGRATIONS = {
         "post_status": "TEXT DEFAULT 'active'",
         "share_count_available": "INTEGER",
         "field_meta": "TEXT DEFAULT ''",
+        "collected_account_id": "INTEGER",
     },
     "comments": {
         "reply_count": "INTEGER DEFAULT 0",
@@ -542,7 +562,8 @@ def _valid_email(email: str) -> bool:
 def _assign_legacy(conn: sqlite3.Connection, uid: int) -> None:
     """历史数据（user_id 为 NULL）归属指定用户。"""
     for t in ("topics", "xhs_accounts", "tasks", "topic_tags", "notes",
-              "comments", "authors", "news_sources", "creations", "bids", "news"):
+              "comments", "authors", "news_sources", "creations", "bids", "news",
+              "note_collections"):
         try:
             conn.execute(f"UPDATE {t} SET user_id=? WHERE user_id IS NULL", (uid,))
         except Exception:
@@ -632,6 +653,37 @@ def get_session_user(token: str) -> Optional[Dict[str, Any]]:
                          (now, th))
         return {"id": row["user_id"], "email": row["email"],
                 "created_at": row["created_at"]}
+
+
+def issue_csrf(token: str) -> Optional[str]:
+    """为当前会话签发 CSRF。明文 token 不入库，只更新哈希对应的 csrf_token。"""
+    if get_session_user(token) is None:
+        return None
+    csrf = secrets.token_urlsafe(32)
+    with _lock, _connect() as conn:
+        conn.execute(
+            "UPDATE auth_sessions SET csrf_token=? WHERE token_hash=?",
+            (csrf, _token_hash(token)),
+        )
+    return csrf
+
+
+def csrf_matches(token: str, provided: str) -> bool:
+    """校验调用方在已登录会话上附带的 CSRF。不匹配时不回显任何令牌。"""
+    provided = provided or ""
+    if not token or not provided:
+        return False
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT csrf_token FROM auth_sessions WHERE token_hash=?",
+            (_token_hash(token),),
+        ).fetchone()
+    if not row:
+        return False
+    saved = row["csrf_token"] or ""
+    if not saved or len(saved) != len(provided):
+        return False
+    return secrets.compare_digest(saved, provided)
 
 
 def delete_auth_session(token: str) -> None:
@@ -835,8 +887,8 @@ def upsert_note(note: Dict[str, Any]) -> bool:
             " fans_count, publish_time, publish_time_raw, ip_location, tags, media_type,"
             " liked_count, collected_count, comment_count, share_count, note_url, source_keyword,"
             " sentiment, sentiment_score, collected_at, created_at,"
-            " post_status, share_count_available, field_meta)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            " post_status, share_count_available, field_meta, collected_account_id)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 uid, note["post_id"], note["topic_id"], note.get("title", ""), note.get("desc", ""),
                 note.get("author", ""), note.get("author_id", ""),
@@ -852,6 +904,7 @@ def upsert_note(note: Dict[str, Any]) -> bool:
                 (1 if note.get("share_count_available") else 0),
                 note.get("field_meta") if isinstance(note.get("field_meta"), str)
                 else json.dumps(note.get("field_meta") or {}, ensure_ascii=False),
+                note.get("collected_account_id"),
             ),
         )
         return cur.rowcount > 0
@@ -1076,7 +1129,8 @@ def list_accounts() -> List[Dict[str, Any]]:
     with _connect() as conn:
         rows = conn.execute(
             "SELECT id, nickname, xhs_user_id, avatar_url, status, added_at,"
-            f" last_used_at, last_check_at, check_note FROM xhs_accounts {clause} ORDER BY id",
+            " last_used_at, last_check_at, check_note, daily_quota, quota_used,"
+            f" quota_day, skip_until, fail_streak FROM xhs_accounts {clause} ORDER BY id",
             params,
         ).fetchall()
         return [dict(r) for r in rows]
@@ -1091,6 +1145,34 @@ def get_account(account_id: int) -> Optional[Dict[str, Any]]:
         return dict(row) if row else None
 
 
+def find_account_by_xhs_user_id(xhs_user_id: str) -> Optional[Dict[str, Any]]:
+    """按小红书用户 id 找当前用户名下的账号。找不到返回 None。"""
+    xhs_user_id = (xhs_user_id or "").strip()
+    if not xhs_user_id:
+        return None
+    where, params = ["xhs_user_id=?"], [xhs_user_id]
+    _uw(where, params)
+    with _connect() as conn:
+        row = conn.execute(
+            f"SELECT * FROM xhs_accounts WHERE {' AND '.join(where)} ORDER BY id DESC LIMIT 1",
+            params,
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def list_accounts_full() -> List[Dict[str, Any]]:
+    """轮换用：含登录密文。不要把返回值交给前端。"""
+    where, params = [], []
+    _uw(where, params)
+    clause = f"WHERE {' AND '.join(where)}" if where else ""
+    with _connect() as conn:
+        rows = conn.execute(
+            f"SELECT * FROM xhs_accounts {clause} ORDER BY last_used_at ASC, id ASC",
+            params,
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
 def create_account(nickname: str = "", xhs_user_id: str = "") -> int:
     with _lock, _connect() as conn:
         cur = conn.execute(
@@ -1103,7 +1185,8 @@ def create_account(nickname: str = "", xhs_user_id: str = "") -> int:
 
 def update_account(account_id: int, fields: Dict[str, Any]) -> bool:
     allowed = {"nickname", "xhs_user_id", "avatar_url", "status",
-               "login_data_enc", "last_used_at", "last_check_at", "check_note"}
+               "login_data_enc", "last_used_at", "last_check_at", "check_note",
+               "daily_quota", "quota_used", "quota_day", "skip_until", "fail_streak"}
     sets = {k: v for k, v in fields.items() if k in allowed}
     if not sets:
         return False
@@ -1152,9 +1235,40 @@ def list_valid_accounts_lru() -> List[Dict[str, Any]]:
 
 
 def next_collection_account() -> Optional[Dict[str, Any]]:
-    """采集轮询：选最久未使用的有效账号。没有则返回 None。"""
-    rows = list_valid_accounts_lru()
-    return rows[0] if rows else None
+    """采集轮询：健康、未超配额、最久未使用的账号。没有则返回 None。"""
+    from .account_rotation import first_eligible
+    return first_eligible()
+
+
+def record_note_collection(post_id: str, topic_id: Optional[int],
+                           account_id: Optional[int], task_id: Optional[int] = None,
+                           source: str = "account") -> None:
+    """记下哪一个账号（或已登录的浏览器会话）采到了这条帖子。不存 Cookie。"""
+    post_id = (post_id or "").strip()
+    if not post_id:
+        return
+    source = source or "account"
+    if not account_id and source != "browser_use_profile":
+        return
+    uid = _current_uid.get()
+    with _lock, _connect() as conn:
+        conn.execute(
+            "INSERT INTO note_collections (user_id, post_id, topic_id, account_id,"
+            " task_id, source, collected_at) VALUES (?,?,?,?,?,?,?)",
+            (uid, post_id, topic_id, account_id, task_id, source, int(time.time())),
+        )
+
+
+def list_note_collections(post_id: str) -> List[Dict[str, Any]]:
+    where, params = ["post_id=?"], [post_id]
+    _uw(where, params)
+    with _connect() as conn:
+        rows = conn.execute(
+            f"SELECT id, post_id, topic_id, account_id, task_id, source, collected_at"
+            f" FROM note_collections WHERE {' AND '.join(where)} ORDER BY id",
+            params,
+        ).fetchall()
+        return [dict(r) for r in rows]
 
 
 def _public_note(row: sqlite3.Row) -> Dict[str, Any]:

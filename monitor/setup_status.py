@@ -6,7 +6,7 @@ from typing import Any, Dict, List, Optional
 
 from .config import (DATA_DIR, bind_host, bind_port, browser_use_enabled,
                      collection_fixture_enabled, cookie_handshake_enabled,
-                     ensure_dirs)
+                     ensure_dirs, saas_mode)
 from . import db
 
 
@@ -125,6 +125,7 @@ def build_setup_status(user_id: Optional[int] = None) -> Dict[str, Any]:
             "code": xhs.get("code") or ("xhs_ready" if xhs["ok"] else "need_xhs_session"),
         },
         "optional": {
+            "saas": saas_mode(),
             "cookie_handshake": cookie_handshake_enabled(),
             "browser_use": browser_use_enabled(),
         },
