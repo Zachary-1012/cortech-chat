@@ -180,17 +180,30 @@ monitor/                    FastAPI 后端（采集 / 分析 / AI / 伪冒反查
   db.py                     SQLite 数据层（参数化 SQL + 用户隔离）
   fakecheck.py              伪冒反查（判定模式库、嫌疑账号、举报材料）
   seed_data/                内置示例数据
-frontend/dist/              前端构建产物（Vue 3 + TS + Vite，由后端托管）
+frontend/                  Vue 3 + Vite 源码（`src/`、`package.json`）
+frontend/dist/              `npm run build` 的产物，由后端托管
 CortechChat.py              Windows 桌面客户端启动器
 ```
 
 - **后端**：Python + FastAPI + SQLite（参数化 SQL、无注入；XSS 防护）
-- **前端**：Vue 3 + TypeScript + Vite，Claude 暖色设计规范
+- **前端**：Vue 3 + Vite。源码在 `frontend/src`，页面路由覆盖总览、话题、帖子、时间线、热词、事件、达人、竞品、预警、伪冒反查、资讯、创作、比稿、对话、设置、登录和账号。
 - **AI**：多 Provider（Groq / Gemini / 自定义 OpenAI 兼容网点），失败自动顺延 + **规则兜底**
 - **采集**：小红书网页端 direct-API，登录态复用，失效时降级浏览器引擎
 - **安全**：登录态 Fernet 加密（密钥 600 权限）；API key 只存本地、不入库不入日志
 
-> 说明：本仓库只包含**前端构建产物**（`frontend/dist/`），前端源码不在仓库内。
+### 前端构建
+
+页面源码在 `frontend/`。改完界面后重新构建，后端会托管 `frontend/dist/`。资源前缀是 `/v3-admin-vite/`，页面路由在站点根路径。
+
+```bash
+cd frontend
+npm install
+npm run build
+```
+
+构建产物写到 `frontend/dist/`。然后 `python3 -m monitor.app`，打开 <http://127.0.0.1:8000>。开发时也可以 `npm run dev`（Vite 把 `/api` 代理到 8000 端口）。
+
+达人预估、港版/海外地区和主体核验都不调用付费接口：预估公式写在接口返回的 `formulas` 里；关键词繁简用 OpenCC（`opencc-python-reimplemented`）；主体核验用 GB 32100、Wikidata、信用中国和公示系统公开页，打不开就降级。
 
 ---
 

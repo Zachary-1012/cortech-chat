@@ -52,7 +52,8 @@ def _ensure_columns() -> None:
         for col, ddl in (("domain_tags", "TEXT DEFAULT '[]'"),
                          ("coop_status", "TEXT DEFAULT 'none'"),
                          ("coop_notes", "TEXT DEFAULT ''"),
-                         ("xiaohongshu_id", "TEXT DEFAULT ''")):
+                         ("xiaohongshu_id", "TEXT DEFAULT ''"),
+                         ("region", "TEXT NOT NULL DEFAULT ''")):
             if col not in cols:
                 conn.execute(f"ALTER TABLE authors ADD COLUMN {col} {ddl}")
         conn.commit()
@@ -72,11 +73,29 @@ def list_influencers(q: Optional[str] = None,
                      domain: Optional[str] = None,
                      coop_status: Optional[str] = None,
                      min_fans: int = 0,
-                     page: int = 1, page_size: int = 20) -> Dict[str, Any]:
-    """达人列表，支持搜索、领域、合作状态、粉丝量筛选。"""
+                     page: int = 1, page_size: int = 20,
+                     region: Optional[str] = None) -> Dict[str, Any]:
+    """达人列表，支持搜索、领域、合作状态、粉丝量、采集地区筛选。"""
     _ensure_columns()
     where, params = ["fans_count >= ?"], [int(min_fans)]
     apply_uid_filter(where, params)
+    region_norm = None
+    if region:
+        from .xhs_region import normalize_region
+        region_norm = normalize_region(region)
+        uid = current_user_id()
+        if uid is not None:
+            where.append(
+                "(IFNULL(region,'')=? OR author_id IN ("
+                "SELECT author_id FROM notes WHERE IFNULL(region,'cn')=? AND user_id=?))"
+            )
+            params += [region_norm, region_norm, uid]
+        else:
+            where.append(
+                "(IFNULL(region,'')=? OR author_id IN ("
+                "SELECT author_id FROM notes WHERE IFNULL(region,'cn')=?))"
+            )
+            params += [region_norm, region_norm]
     if q:
         where.append("(nickname LIKE ? OR author_id LIKE ? OR xiaohongshu_id LIKE ?)")
         params += [f"%{q}%"] * 3
@@ -92,7 +111,7 @@ def list_influencers(q: Optional[str] = None,
         rows = conn.execute(
             "SELECT author_id, nickname, fans_count, liked_count, notes_count,"
             " ip_location, domain_tags, coop_status, coop_notes, xiaohongshu_id,"
-            " updated_at FROM authors"
+            " region, updated_at FROM authors"
             f" {w} ORDER BY fans_count DESC LIMIT ? OFFSET ?",
             (*params, page_size, (page - 1) * page_size),
         ).fetchall()
@@ -114,7 +133,16 @@ def list_influencers(q: Optional[str] = None,
             d["coop_label"] = COOP_LABEL.get(d["coop_status"], "未合作")
             d["cortech_score"] = _scores.get(d["author_id"], 0.0)
             items.append(d)
-        return {"total": total, "page": page, "page_size": page_size, "items": items}
+        from .influencer_estimates import FORMULAS, estimates_for
+        est = estimates_for(
+            [d["author_id"] for d in items],
+            {d["author_id"]: d for d in items},
+            region=region_norm,
+        )
+        for d in items:
+            d["estimate"] = est.get(d["author_id"])
+        return {"total": total, "page": page, "page_size": page_size,
+                "region": region_norm or "", "formulas": FORMULAS, "items": items}
 
 
 def get_influencer(author_id: str) -> Optional[Dict[str, Any]]:
@@ -124,7 +152,7 @@ def get_influencer(author_id: str) -> Optional[Dict[str, Any]]:
         r = conn.execute(
             "SELECT author_id, nickname, fans_count, liked_count, notes_count,"
             " ip_location, domain_tags, coop_status, coop_notes, xiaohongshu_id,"
-            " updated_at FROM authors WHERE author_id=?" + extra,
+            " region, updated_at FROM authors WHERE author_id=?" + extra,
             (author_id, *extra_p)).fetchone()
         if not r:
             return None
@@ -136,6 +164,8 @@ def get_influencer(author_id: str) -> Optional[Dict[str, Any]]:
             d["domain_tags"] = []
         d["fans_level"] = _fans_level(d["fans_count"] or 0)
         d["coop_label"] = COOP_LABEL.get(d["coop_status"], "未合作")
+        from .influencer_estimates import estimate_author
+        d["estimate"] = estimate_author(author_id, d)
         return d
 
 
@@ -231,7 +261,8 @@ def domain_stats() -> List[Dict[str, Any]]:
     return [{"domain": k, "count": v} for k, v in c.most_common(30)]
 
 
-def similar_influencers(author_id: str, limit: int = 10) -> List[Dict[str, Any]]:
+def similar_influencers(author_id: str, limit: int = 10,
+                        region: Optional[str] = None) -> List[Dict[str, Any]]:
     """相似达人推荐（灰豚逆向：/anchor/detail/likeAnchors）。
 
     按领域标签重叠度 + 粉丝量级接近度打分，排除自己。
@@ -244,6 +275,11 @@ def similar_influencers(author_id: str, limit: int = 10) -> List[Dict[str, Any]]
     t_tags = set(target.get("domain_tags") or [])
     t_fans = target.get("fans_count") or 0
     t_level = _fans_level(t_fans)
+    t_category = ((target.get("estimate") or {}).get("category") or "")
+    region_norm = None
+    if region:
+        from .xhs_region import normalize_region
+        region_norm = normalize_region(region)
 
     import math
     scored = []
@@ -252,7 +288,7 @@ def similar_influencers(author_id: str, limit: int = 10) -> List[Dict[str, Any]]
         rows = conn.execute(
             "SELECT author_id, nickname, fans_count, liked_count, notes_count,"
             " ip_location, domain_tags, coop_status, coop_notes, xiaohongshu_id,"
-            " updated_at FROM authors WHERE author_id != ?" + extra,
+            " region, updated_at FROM authors WHERE author_id != ?" + extra,
             (author_id, *extra_p)).fetchall()
         for r in rows:
             d = dict(r)
@@ -280,4 +316,22 @@ def similar_influencers(author_id: str, limit: int = 10) -> List[Dict[str, Any]]
             d["similarity"] = score
             scored.append(d)
     scored.sort(key=lambda x: x["similarity"], reverse=True)
-    return scored[:limit]
+    picked = scored[: max(limit * 3, limit)]
+    if region_norm:
+        picked = [d for d in picked
+                  if (d.get("region") or "") in ("", region_norm)] or picked
+    from .influencer_estimates import estimates_for
+    est = estimates_for([d["author_id"] for d in picked],
+                        {d["author_id"]: d for d in picked},
+                        region=region_norm)
+    for d in picked:
+        d["estimate"] = est.get(d["author_id"])
+        same_cat = t_category and t_category != "未分类" and (
+            (d.get("estimate") or {}).get("category") == t_category)
+        if same_cat:
+            d["similarity"] = round(min(1.0, d["similarity"] + 0.05), 3)
+            d["similar_reason"] = "领域接近，内容类目相同"
+        else:
+            d["similar_reason"] = "领域标签或粉丝量级接近"
+    picked.sort(key=lambda x: x["similarity"], reverse=True)
+    return picked[:limit]

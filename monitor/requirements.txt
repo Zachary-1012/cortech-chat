@@ -17,3 +17,4 @@ bcrypt>=4.0  # 注册登录密码哈希（cost 12）
 openpyxl>=3.1  # 伪冒反查 Excel 导出（V1.1），纯开源
 xhshow>=0.2.0  # 小红书 X-S 签名（MIT，Cloxl/xhshow），采集器必需
 fpdf2>=2.8  # PDF 导出（纯 Python，轻量）
+opencc-python-reimplemented>=0.1.7  # OpenCC 繁简转换（香港用字 s2hk/hk2s），纯 Python

@@ -265,7 +265,8 @@ CREATE INDEX IF NOT EXISTS idx_note_collections_post ON note_collections(user_id
 # 增量迁移：老库缺列时补列（表已存在时 CREATE TABLE 不生效）
 _MIGRATIONS = {
     "topics": {"engine": "TEXT NOT NULL DEFAULT 'cortech_browser'",
-               "user_id": "INTEGER"},
+               "user_id": "INTEGER",
+               "region": "TEXT NOT NULL DEFAULT 'cn'"},
     "xhs_accounts": {
         "user_id": "INTEGER",
         "daily_quota": "INTEGER NOT NULL DEFAULT 0",
@@ -303,7 +304,10 @@ _MIGRATIONS = {
         "share_count_available": "INTEGER",
         "field_meta": "TEXT DEFAULT ''",
         "collected_account_id": "INTEGER",
+        "region": "TEXT NOT NULL DEFAULT 'cn'",
+        "content_script": "TEXT NOT NULL DEFAULT ''",
     },
+    "authors": {"region": "TEXT NOT NULL DEFAULT ''"},
     "comments": {
         "reply_count": "INTEGER DEFAULT 0",
         "ip_location": "TEXT DEFAULT ''",
@@ -746,21 +750,27 @@ def get_topic(topic_id: int) -> Optional[Dict[str, Any]]:
 
 def create_topic(name: str, keywords: str, max_notes: int = 50,
                  enable_comments: int = 1, cron: str = "0 2 * * *",
-                 enabled: int = 0, engine: str = "cortech_direct") -> int:
+                 enabled: int = 0, engine: str = "cortech_direct",
+                 region: str = "cn") -> int:
     """纯手动触发为默认：enabled=0（定时采集为可选项，用户手动开启）"""
+    from .xhs_region import normalize_region
     uid = _current_uid.get()
     with _lock, _connect() as conn:
         cur = conn.execute(
-            "INSERT INTO topics (user_id, name, keywords, max_notes, enable_comments, cron, enabled, engine, created_at)"
-            " VALUES (?,?,?,?,?,?,?,?,?)",
-            (uid, name, keywords, max_notes, enable_comments, cron, enabled, engine, int(time.time())),
+            "INSERT INTO topics (user_id, name, keywords, max_notes, enable_comments, cron, enabled, engine, region, created_at)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (uid, name, keywords, max_notes, enable_comments, cron, enabled, engine,
+             normalize_region(region), int(time.time())),
         )
         return cur.lastrowid
 
 
 def update_topic(topic_id: int, fields: Dict[str, Any]) -> bool:
-    allowed = {"name", "keywords", "max_notes", "enable_comments", "cron", "enabled", "engine"}
+    allowed = {"name", "keywords", "max_notes", "enable_comments", "cron", "enabled", "engine", "region"}
     sets = {k: v for k, v in fields.items() if k in allowed}
+    if "region" in sets:
+        from .xhs_region import normalize_region
+        sets["region"] = normalize_region(sets["region"])
     if not sets:
         return False
     where, params = ["id=?"], [topic_id]
@@ -894,8 +904,9 @@ def upsert_note(note: Dict[str, Any]) -> bool:
             " fans_count, publish_time, publish_time_raw, ip_location, tags, media_type,"
             " liked_count, collected_count, comment_count, share_count, note_url, source_keyword,"
             " sentiment, sentiment_score, collected_at, created_at,"
-            " post_status, share_count_available, field_meta, collected_account_id)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            " post_status, share_count_available, field_meta, collected_account_id,"
+            " region, content_script)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 uid, note["post_id"], note["topic_id"], note.get("title", ""), note.get("desc", ""),
                 note.get("author", ""), note.get("author_id", ""),
@@ -912,6 +923,8 @@ def upsert_note(note: Dict[str, Any]) -> bool:
                 note.get("field_meta") if isinstance(note.get("field_meta"), str)
                 else json.dumps(note.get("field_meta") or {}, ensure_ascii=False),
                 note.get("collected_account_id"),
+                note.get("region") or "cn",
+                note.get("content_script") or "",
             ),
         )
         return cur.rowcount > 0
@@ -951,27 +964,34 @@ def upsert_author(author: Dict[str, Any]) -> None:
     with _lock, _connect() as conn:
         conn.execute(
             "INSERT INTO authors (user_id, author_id, nickname, fans_count, liked_count, notes_count,"
-            " ip_location, updated_at) VALUES (?,?,?,?,?,?,?,?)"
+            " ip_location, region, updated_at) VALUES (?,?,?,?,?,?,?,?,?)"
             " ON CONFLICT(user_id, author_id) DO UPDATE SET"
             " nickname=excluded.nickname, fans_count=excluded.fans_count,"
             " liked_count=excluded.liked_count, notes_count=excluded.notes_count,"
-            " ip_location=excluded.ip_location, updated_at=excluded.updated_at",
+            " ip_location=excluded.ip_location,"
+            " region=CASE WHEN excluded.region!='' THEN excluded.region ELSE authors.region END,"
+            " updated_at=excluded.updated_at",
             (uid, aid, author.get("nickname", ""), author.get("fans_count", 0),
              author.get("liked_count", 0), author.get("notes_count", 0),
-             author.get("ip_location", ""), now),
+             author.get("ip_location", ""), author.get("region") or "", now),
         )
 
 
 def list_posts(topic_id: Optional[int] = None, sentiment: Optional[str] = None,
                q: Optional[str] = None, page: int = 1, page_size: int = 20,
-               date_from: Optional[str] = None, date_to: Optional[str] = None) -> Dict[str, Any]:
-    """date_from/date_to: YYYY-MM-DD，按发布时间过滤"""
+               date_from: Optional[str] = None, date_to: Optional[str] = None,
+               region: Optional[str] = None) -> Dict[str, Any]:
+    """date_from/date_to: YYYY-MM-DD，按发布时间过滤。region: cn / hk / overseas。"""
     where, params = [], []
     _uw(where, params)
     if topic_id:
         where.append("topic_id=?"); params.append(topic_id)
     if sentiment:
         where.append("sentiment=?"); params.append(sentiment)
+    if region:
+        from .xhs_region import normalize_region
+        where.append("IFNULL(region,'cn')=?")
+        params.append(normalize_region(region))
     if q:
         where.append("(title LIKE ? OR desc LIKE ? OR author LIKE ?)")
         params += [f"%{q}%"] * 3
@@ -1004,13 +1024,19 @@ def list_comments(post_id: str, page: int = 1, page_size: int = 50) -> Dict[str,
                 "items": [dict(r) for r in rows]}
 
 
-def stats(topic_id: Optional[int] = None) -> Dict[str, Any]:
+def stats(topic_id: Optional[int] = None, region: Optional[str] = None) -> Dict[str, Any]:
+    from .xhs_region import REGION_LABEL, normalize_region
     uid = _current_uid.get()
     nw, np = [], []
     if topic_id:
         nw.append("topic_id=?"); np.append(topic_id)
     if uid is not None:
         nw.append("user_id=?"); np.append(uid)
+    region_where = list(nw)
+    region_params = list(np)
+    if region:
+        nw.append("IFNULL(region,'cn')=?")
+        np.append(normalize_region(region))
     nwhere = f"WHERE {' AND '.join(nw)}" if nw else ""
     cw, cp = [], []
     if topic_id:
@@ -1018,6 +1044,9 @@ def stats(topic_id: Optional[int] = None) -> Dict[str, Any]:
     if uid is not None:
         cw.append("n.user_id=?"); cp.append(uid)
         cw.append("c.user_id=?"); cp.append(uid)
+    if region:
+        cw.append("IFNULL(n.region,'cn')=?")
+        cp.append(normalize_region(region))
     cwhere = f"WHERE {' AND '.join(cw)}" if cw else ""
     with _connect() as conn:
         total_notes = conn.execute(
@@ -1055,6 +1084,17 @@ def stats(topic_id: Optional[int] = None) -> Dict[str, Any]:
             " ORDER BY (liked_count + comment_count * 3) DESC LIMIT 10",
             np,
         ).fetchall()
+        rw = f"WHERE {' AND '.join(region_where)}" if region_where else ""
+        region_rows = conn.execute(
+            f"SELECT IFNULL(region,'cn') AS region, COUNT(*) AS n FROM notes {rw}"
+            " GROUP BY IFNULL(region,'cn')",
+            region_params,
+        ).fetchall()
+        by_region = [
+            {"region": r["region"], "label": REGION_LABEL.get(r["region"], r["region"]),
+             "count": r["n"]}
+            for r in region_rows
+        ]
         return {
             "total_notes": total_notes,
             "active_notes": active_notes,
@@ -1067,6 +1107,8 @@ def stats(topic_id: Optional[int] = None) -> Dict[str, Any]:
             "total_comments": total_comments,
             "sentiment_dist": dist,
             "negative_top10": [dict(r) for r in neg_top],
+            "region": normalize_region(region) if region else "",
+            "by_region": by_region,
         }
 
 

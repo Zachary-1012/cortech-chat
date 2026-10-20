@@ -76,7 +76,8 @@ def _classify_tiers(posts: List[Dict[str, Any]]) -> None:
             p["tier"] = "tail"
 
 
-def get_timeline(topic_id: int, granularity: str = "auto") -> Dict[str, Any]:
+def get_timeline(topic_id: int, granularity: str = "auto",
+                 region: Optional[str] = None) -> Dict[str, Any]:
     """话题时间线。
 
     返回：
@@ -104,7 +105,7 @@ def get_timeline(topic_id: int, granularity: str = "auto") -> Dict[str, Any]:
         granularity = "auto"
 
     # 取该话题全部帖子（不分页）
-    res = db.list_posts(topic_id=topic_id, page=1, page_size=100000)
+    res = db.list_posts(topic_id=topic_id, page=1, page_size=100000, region=region)
     notes = res.get("items", [])
 
     timed: List[Dict[str, Any]] = []

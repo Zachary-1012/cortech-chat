@@ -364,9 +364,14 @@ def main():
                 os.environ[key] = val
         reset_for_tests()
 
-    static_html = ( __import__("pathlib").Path(__file__).resolve().parent / "static" / "index.html").read_text(encoding="utf-8")
-    dist_api = ( __import__("pathlib").Path(__file__).resolve().parent.parent / "frontend" / "dist" / "assets" / "index-VG6IEY1v.js").read_text(encoding="utf-8")
-    check("旧 /api/notes 已改到 /api/posts", "/api/notes" not in static_html and 'url:"/notes"' not in dist_api)
+    from pathlib import Path as _DistPath
+    static_html = (_DistPath(__file__).resolve().parent / "static" / "index.html").read_text(encoding="utf-8")
+    dist_assets = _DistPath(__file__).resolve().parent.parent / "frontend" / "dist" / "assets"
+    dist_api = "\n".join(
+        p.read_text(encoding="utf-8", errors="ignore") for p in dist_assets.glob("*.js")
+    ) if dist_assets.is_dir() else ""
+    check("旧 /api/notes 已改到 /api/posts",
+          "/api/notes" not in static_html and 'url:"/notes"' not in dist_api and bool(dist_api))
 
     # ---- 5. 趋势/预警/简报/报告 ----
     t = trends.get_trends(tid, 7)
@@ -813,6 +818,121 @@ def main():
             conn.execute("DELETE FROM auth_sessions WHERE user_id IN "
                          "(SELECT id FROM users WHERE email=?)", (p3_email,))
             conn.execute("DELETE FROM users WHERE email=?", (p3_email,))
+
+    # ---- 11. 达人预估 / 港版地区 / 公开主体核验 / 前端源码 ----
+    from monitor.entity_verify import LookupDegraded, complete_uscc, lookup, uscc_valid
+    from monitor.influencer_estimates import FORMULAS, estimate_from_notes
+    from monitor.xhs_hosts import merge_cookie_rows as merge_rows_region
+    from monitor.xhs_region import expand_keywords, region_profile
+
+    sample_author = {"fans_count": 100000, "notes_count": 12, "domain_tags": ["美妆"]}
+    now_ts = int(time.time())
+    sample_notes = [{
+        "liked_count": 3500, "collected_count": 900, "comment_count": 180,
+        "share_count": 0, "share_count_available": 0,
+        "publish_time": now_ts - i * 3 * 86400,
+        "title": "口红试色", "tags": "美妆", "media_type": "image",
+    } for i in range(8)]
+    est = estimate_from_notes(sample_author, sample_notes)
+    check("达人预估含阅读曝光互动率报价和置信度",
+          est["estimated_reads"] > 3500
+          and est["estimated_exposure"] > est["estimated_reads"]
+          and est["engagement_rate"] and est["quote"]["low"] < est["quote"]["high"]
+          and est["cpe"] and est["cpm"] and est["category"] == "美妆"
+          and est["confidence"]["level"] == "high"
+          and 0 <= est["fan_quality"] <= 100
+          and "reads" in FORMULAS and "cpe" in FORMULAS)
+    low_quality = estimate_from_notes(
+        {"fans_count": 200000, "notes_count": 4, "domain_tags": []},
+        [{"liked_count": 20, "collected_count": 0, "comment_count": 0,
+          "share_count_available": 0, "publish_time": now_ts, "title": "x", "tags": ""}] * 4)
+    check("低互动高粉丝拉高可疑粉丝分", low_quality["suspicious_fan_score"] >= 30)
+
+    expanded = expand_keywords(["广州软件"], "hk")
+    check("OpenCC 香港用字繁简扩展", "廣州軟件" in expanded and "广州软件" in expanded)
+    hk_profile = region_profile("hk")
+    sea_profile = region_profile("overseas")
+    check("港版沿用 edith 并带 zh-HK",
+          hk_profile.api_origin == "https://edith.xiaohongshu.com"
+          and hk_profile.web_origin == "https://www.xiaohongshu.com"
+          and "zh-HK" in hk_profile.accept_language)
+    check("海外 RED 使用 rednote 主机",
+          sea_profile.web_origin == "https://www.rednote.com"
+          and sea_profile.api_origin == "https://webapi.rednote.com"
+          and sea_profile.requires_web_session is False)
+    hk_cookie = merge_rows_region([
+        {"name": "a1", "value": "from-com", "domain": ".xiaohongshu.com"},
+        {"name": "a1", "value": "from-hk", "domain": ".xiaohongshu.hk"},
+    ], region="hk")
+    check("香港采集同名 Cookie 优先 .hk",
+          hk_cookie and hk_cookie[0]["value"] == "from-hk")
+
+    uscc = complete_uscc("91310000MA1FL2G83")
+    check("统一社会信用代码可本地校验", uscc_valid(uscc) and not uscc_valid(uscc[:-1] + "0"))
+
+    def _offline(_name):
+        raise LookupDegraded("离线")
+
+    degraded = lookup("行吟信息科技（上海）有限公司", fetchers=[_offline], use_cache=False)
+    check("公开源失败时降级且不依赖付费企查查",
+          degraded["ok"] is False and degraded["degraded"] is True
+          and "付费" not in degraded["message"] and "API Key" not in degraded["message"]
+          and degraded.get("paid_api") is False)
+    local_code = lookup(uscc, online=False, use_cache=False)
+    check("校验码通过时返回结构化代码",
+          local_code["ok"] is True and local_code["uscc"]["valid"] is True
+          and local_code["matches"][0]["credit_code"] == uscc)
+    fc_src = (__import__("pathlib").Path(__file__).resolve().parent / "fakecheck.py").read_text(encoding="utf-8")
+    check("qcc_lookup 转到公开核验", "entity_verify" in fc_src and "付费服务" not in fc_src)
+
+    front = __import__("pathlib").Path(__file__).resolve().parent.parent / "frontend"
+    check("前端源码可构建",
+          (front / "package.json").is_file() and (front / "src" / "main.js").is_file()
+          and (front / "src" / "views" / "Influencers.vue").is_file()
+          and (front / "src" / "views" / "Fakecheck.vue").is_file()
+          and "vue" in (front / "package.json").read_text(encoding="utf-8"))
+    dist_index = (front / "dist" / "index.html").read_text(encoding="utf-8")
+    check("构建产物仍由 /v3-admin-vite/ 托管",
+          "/v3-admin-vite/assets/" in dist_index and "Cortech Chat" in dist_index)
+
+    est_user = _raw_user("est")
+    try:
+        db.set_current_user(est_user)
+        topic_est = db.create_topic("预估话题", "口红", region="hk")
+        db.upsert_note({
+            "post_id": "est_note_1", "topic_id": topic_est, "title": "口紅試色",
+            "author": "预估达人", "author_id": "est_author", "fans_count": 80000,
+            "publish_time": now_ts - 86400, "liked_count": 2400, "collected_count": 600,
+            "comment_count": 90, "share_count": 0, "share_count_available": 0,
+            "region": "hk", "content_script": "hant", "collected_at": now_ts,
+        })
+        db.upsert_author({
+            "author_id": "est_author", "nickname": "预估达人", "fans_count": 80000,
+            "region": "hk",
+        })
+        from monitor import influencers as est_influencers
+        listed = est_influencers.list_influencers(q="预估达人", region="hk")
+        row = listed["items"][0]
+        check("达人列表带预估且可按香港筛选",
+              listed["total"] >= 1 and row["estimate"]["estimated_reads"] > 0
+              and row["estimate"]["quote"]["high"] > row["estimate"]["quote"]["low"]
+              and "formulas" in listed)
+        similar = est_influencers.similar_influencers("est_author", limit=5)
+        check("相似推荐接口可调用", isinstance(similar, list))
+        st = db.stats(region="hk")
+        check("统计可按地区过滤",
+              any(item["region"] == "hk" and item["count"] >= 1 for item in st["by_region"])
+              and st["region"] == "hk" and st["total_notes"] >= 1)
+        posts = db.list_posts(region="cn")
+        check("大陆筛选看不到香港样例帖",
+              all(p["post_id"] != "est_note_1" for p in posts["items"]))
+    finally:
+        db.set_current_user(None)
+        with db._connect() as conn:
+            conn.execute("DELETE FROM notes WHERE post_id='est_note_1'")
+            conn.execute("DELETE FROM authors WHERE author_id='est_author'")
+            conn.execute("DELETE FROM topics WHERE name='预估话题'")
+            conn.execute("DELETE FROM users WHERE id=?", (est_user,))
 
     # ---- 汇总 ----
     fails = [n for n, ok in results if not ok]

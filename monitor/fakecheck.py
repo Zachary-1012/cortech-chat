@@ -1119,8 +1119,8 @@ def get_sweep_task(tid: int) -> Optional[Dict[str, Any]]:
 def cluster_subjects(brand_id: int) -> Dict[str, Any]:
     """按经营者 / 统一信用代码 / 注册地址 / 认证主体聚类（≥2 账号才成团）。
 
-    企查查在线核验预留：qcc_lookup() 需企查查开放平台 API Key（付费），
-    未配置时请在嫌疑详情页手动录入经营者/信用代码/地址后参与聚类。
+    主体核验走公开来源（国家标准校验码、Wikidata、信用中国、公示系统公开页）。
+    公示系统需要验证码时会降级。请在嫌疑详情页手动录入经营者/信用代码/地址后参与聚类。
     """
     _require_brand(brand_id)
     with _connect() as conn:
@@ -1154,23 +1154,16 @@ def cluster_subjects(brand_id: int) -> Dict[str, Any]:
         "by_address": _groups("reg_address", "同一注册地址"),
         "by_subject": _groups("subject", "同一认证主体"),
         "total": len(items),
-        "qcc_note": "企查查在线核验需企查查开放平台 API Key（付费）；"
-                    "未配置时可在嫌疑详情页手动录入经营者/信用代码/地址后参与聚类。",
+        "qcc_note": "主体核验使用公开来源，不调用企查查。"
+                    "公示系统打不开或需要验证码时会降级，"
+                    "可在嫌疑详情页手动录入经营者/信用代码/地址后参与聚类。",
     }
 
 
 def qcc_lookup(name: str) -> Dict[str, Any]:
-    """企查查在线核验（预留接口，未接通时诚实说明）。"""
-    name = (name or "").strip()
-    if not name:
-        raise ValueError("请填写要核验的主体名称")
-    return {
-        "ok": False,
-        "subject": name,
-        "message": ("企查查在线核验尚未接通：需要企查查开放平台 API Key（付费服务）。"
-                    "接通前请在嫌疑详情页手动录入经营者/统一信用代码/注册地址，"
-                    "录入后即可参与主体聚类分析。"),
-    }
+    """主体核验。保留原路径名，实现改为公开来源，不再调用企查查。"""
+    from .entity_verify import lookup
+    return lookup(name)
 
 
 # ---------------- 证据包导出 ----------------

@@ -93,6 +93,8 @@ class NoteData:
     media_type: str = ""
     note_url: str = ""
     source_keyword: str = ""
+    region: str = "cn"
+    content_script: str = ""
 
 
 @dataclass
@@ -126,6 +128,7 @@ class CrawlContext:
     account_name: str = ""
     report_progress: Callable[[int, str], None] = lambda pct, detail: None
     should_stop: Callable[[], bool] = lambda: False
+    region: str = "cn"
 
 
 @dataclass
@@ -174,23 +177,26 @@ def convert_cookies(cookies: list) -> Tuple[str, Dict[str, str]]:
     return cookies_str, cookie_dict
 
 
-def cookies_from_state_dict(state: Dict[str, Any]) -> Tuple[str, Dict[str, str]]:
+def cookies_from_state_dict(state: Dict[str, Any],
+                            region: str = "cn") -> Tuple[str, Dict[str, str]]:
     """从用户已保存的 storage_state 读取 Cookie，不启动浏览器。
 
-    .com / .cn / .hk 都收；同名时 .com 优先。其它域名丢掉。
+    .com / .cn / .hk / rednote 都收。大陆同名时 .com 优先；
+    香港优先 .hk；海外优先 rednote。其它域名丢掉。
     """
     from .xhs_hosts import merge_cookie_rows
-    picked = merge_cookie_rows(state.get("cookies") or [])
+    picked = merge_cookie_rows(state.get("cookies") or [], region=region)
     return convert_cookies(picked)
 
 
-async def _read_login_cookies(profile_dir=None) -> Tuple[str, Dict[str, str]]:
+async def _read_login_cookies(profile_dir=None,
+                              region: str = "cn") -> Tuple[str, Dict[str, str]]:
     """读取扫码或握手保存的登录缓存。storage_state.json 不需要浏览器。"""
     cache = Path(profile_dir) if profile_dir else active_login_cache_dir()
     state_file = cache / "storage_state.json"
     if state_file.exists():
         state = json.loads(state_file.read_text(encoding="utf-8"))
-        return cookies_from_state_dict(state)
+        return cookies_from_state_dict(state, region=region)
     try:
         from playwright.async_api import async_playwright
     except ImportError:
@@ -208,7 +214,7 @@ async def _read_login_cookies(profile_dir=None) -> Tuple[str, Dict[str, str]]:
                     args=["--no-sandbox", "--disable-blink-features=AutomationControlled"])
                 try:
                     from .xhs_hosts import collect_context_cookies
-                    cookies = await collect_context_cookies(ctx2)
+                    cookies = await collect_context_cookies(ctx2, region=region)
                 finally:
                     await ctx2.close()
                 return convert_cookies(cookies)
@@ -238,9 +244,13 @@ class XHSClient:
     签名：xhshow（MIT）。端点：edith.xiaohongshu.com。
     """
 
-    def __init__(self, headers: Dict[str, str], cookie_dict: Dict[str, str]):
+    def __init__(self, headers: Dict[str, str], cookie_dict: Dict[str, str],
+                 api_origin: str = _DOMAIN,
+                 web_origin: str = "https://www.xiaohongshu.com"):
         self.headers = headers
         self.cookie_dict = cookie_dict
+        self.api_origin = (api_origin or _DOMAIN).rstrip("/")
+        self.web_origin = (web_origin or "https://www.xiaohongshu.com").rstrip("/")
         self._client = httpx.AsyncClient(timeout=30.0)
 
     def _sign_headers(self, uri: str, data: Any, method: str) -> Dict[str, str]:
@@ -265,7 +275,7 @@ class XHSClient:
                        payload: Optional[Dict] = None,
                        on_detail: bool = False) -> Dict:
         """签名请求。详情接口上的 404 / code=-3 记为删除，不按采集失败重试。"""
-        url = _DOMAIN + uri
+        url = self.api_origin + uri
         for attempt in range(3):
             try:
                 if params is not None:
@@ -358,7 +368,8 @@ class XHSClient:
 # ============ 数据映射（来自 direct_api.py + spider_xhs.py） ============
 
 def _map_note(card: Dict, post_id: str, xsec_token: str,
-              xsec_source: str, keyword: str) -> NoteData:
+              xsec_source: str, keyword: str,
+              web_origin: str = "https://www.xiaohongshu.com") -> NoteData:
     """详情卡片 → NoteData（来自 direct_api.py::_map_note）"""
     user = card.get("user") or {}
     inter = card.get("interact_info") or {}
@@ -384,14 +395,15 @@ def _map_note(card: Dict, post_id: str, xsec_token: str,
         field_meta=share_meta,
         post_status="active",
         media_type="video" if ntype == "video" else "image",
-        note_url=(f"https://www.xiaohongshu.com/explore/{post_id}"
+        note_url=(f"{web_origin.rstrip('/')}/explore/{post_id}"
                   f"?xsec_token={xsec_token}&xsec_source={xsec_source}"),
         source_keyword=keyword,
     )
 
 
 def _deleted_note(post_id: str, xsec_token: str, xsec_source: str,
-                  keyword: str, reason: str) -> NoteData:
+                  keyword: str, reason: str,
+                  web_origin: str = "https://www.xiaohongshu.com") -> NoteData:
     """已删除 / 404：保留一条记录，避免和采集失败混在一起。"""
     return NoteData(
         post_id=post_id,
@@ -409,10 +421,17 @@ def _deleted_note(post_id: str, xsec_token: str, xsec_source: str,
             },
         },
         post_status="deleted",
-        note_url=(f"https://www.xiaohongshu.com/explore/{post_id}"
+        note_url=(f"{web_origin.rstrip('/')}/explore/{post_id}"
                   f"?xsec_token={xsec_token}&xsec_source={xsec_source}"),
         source_keyword=keyword,
     )
+
+
+def _stamp_note_region(note: NoteData, region: str) -> NoteData:
+    from .xhs_region import detect_script, normalize_region
+    note.region = normalize_region(region)
+    note.content_script = detect_script(f"{note.title}\n{note.desc}")
+    return note
 
 
 def _map_comment(c: Dict, post_id: str) -> Optional[CommentData]:
@@ -494,19 +513,35 @@ class CortechCrawler:
             if decrypt_profile_to_dir(ctx.account_id, tmpd):
                 profile = tmpd
                 ctx.log(f"[cortech] 使用账号「{ctx.account_name}」的登录态")
+        from .xhs_region import normalize_region, region_profile
+        area = region_profile(normalize_region(getattr(ctx, "region", "cn")))
         try:
-            cookie_str, cookie_dict = await _read_login_cookies(profile)
+            cookie_str, cookie_dict = await _read_login_cookies(profile, region=area.id)
         finally:
             if cleanup:
                 import shutil
                 shutil.rmtree(cleanup, ignore_errors=True)
-        if "web_session" not in cookie_dict or "a1" not in cookie_dict:
-            raise CortechCrawlerFailed("登录失效（Cookie 缺少 a1/web_session），请重新扫码")
+        missing = []
+        if "a1" not in cookie_dict:
+            missing.append("a1")
+        if area.requires_web_session and "web_session" not in cookie_dict:
+            missing.append("web_session")
+        if missing:
+            raise CortechCrawlerFailed(
+                "登录失效（Cookie 缺少 " + "/".join(missing) + "），请重新扫码。"
+                "只使用你已经保存的账号，不会代登录。"
+            )
 
         headers = dict(_BASE_HEADERS)
+        headers["accept-language"] = area.accept_language
+        headers["origin"] = area.web_origin
+        headers["referer"] = area.web_origin + "/"
         headers["Cookie"] = cookie_str
-        client = XHSClient(headers=headers, cookie_dict=cookie_dict)
-        ctx.log("[cortech] 登录态就绪，开始采集")
+        client = XHSClient(headers=headers, cookie_dict=cookie_dict,
+                           api_origin=area.api_origin, web_origin=area.web_origin)
+        ctx.log(f"[cortech] 地区={area.label} 网页={area.web_origin} API={area.api_origin}"
+                f" Accept-Language={area.accept_language}")
+        ctx.log("[cortech] 登录态就绪，开始只读采集")
 
         notes: List[NoteData] = []
         comments: List[CommentData] = []
@@ -592,7 +627,10 @@ class CortechCrawler:
         except _xhs.NoteNotFoundError as e:
             self._deleted = getattr(self, "_deleted", 0) + 1
             ctx.log(f"[cortech] 已删除或不存在 {post_id}：{e}")
-            return _deleted_note(post_id, xsec_token, xsec_source, keyword, str(e))
+            return _stamp_note_region(
+                _deleted_note(post_id, xsec_token, xsec_source, keyword, str(e),
+                              web_origin=getattr(client, "web_origin", "https://www.xiaohongshu.com")),
+                getattr(ctx, "region", "cn"))
         except _xhs.DataFetchError as e:
             self._detail_skipped = getattr(self, "_detail_skipped", 0) + 1
             ctx.log(f"[cortech] 详情采集失败（不是删除） {post_id}：{e}")
@@ -601,9 +639,15 @@ class CortechCrawler:
             self._deleted = getattr(self, "_deleted", 0) + 1
             reason = "详情为空，按已删除或不可浏览处理（HTTP/业务 404 一类）"
             ctx.log(f"[cortech] {reason} {post_id}")
-            return _deleted_note(post_id, xsec_token, xsec_source, keyword, reason)
+            return _stamp_note_region(
+                _deleted_note(post_id, xsec_token, xsec_source, keyword, reason,
+                              web_origin=getattr(client, "web_origin", "https://www.xiaohongshu.com")),
+                getattr(ctx, "region", "cn"))
         await asyncio.sleep(interval)
-        note = _map_note(card, post_id, xsec_token, xsec_source, keyword)
+        note = _stamp_note_region(
+            _map_note(card, post_id, xsec_token, xsec_source, keyword,
+                      web_origin=getattr(client, "web_origin", "https://www.xiaohongshu.com")),
+            getattr(ctx, "region", "cn"))
         # 作者信息补采（来自 spider_xhs.py 的思路）
         await self._enrich_author(client, note)
         return note

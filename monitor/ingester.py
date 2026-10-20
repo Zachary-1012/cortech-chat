@@ -61,6 +61,8 @@ def store_unified(topic_id: int, notes: List[NoteData],
             "sentiment": label, "sentiment_score": score,
             "collected_at": now,
             "collected_account_id": account_id,
+            "region": getattr(n, "region", None) or "cn",
+            "content_script": getattr(n, "content_script", None) or "",
         }):
             n_notes += 1
         db.record_note_collection(
@@ -71,6 +73,7 @@ def store_unified(topic_id: int, notes: List[NoteData],
                 "fans_count": n.author.fans_count, "liked_count": n.author.liked_count,
                 "notes_count": n.author.notes_count,
                 "ip_location": n.author.ip_location,
+                "region": getattr(n, "region", None) or "",
             })
     for c in comments:
         if not c.comment_id or not c.post_id:

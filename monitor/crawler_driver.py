@@ -173,7 +173,10 @@ def _run_task_inner(task_id: int, topic: dict, engine: str, max_notes: Optional[
         db.update_task(task_id, status="running", started_at=int(time.time()),
                         progress=2, progress_detail="任务启动中…")
         crawler = cortech_crawler.get_crawler()
-        keywords = [k.strip() for k in topic["keywords"].split(",") if k.strip()]
+        from .xhs_region import expand_keywords, normalize_region
+        region = normalize_region(topic.get("region") or "cn")
+        raw_keywords = [k.strip() for k in topic["keywords"].split(",") if k.strip()]
+        keywords = expand_keywords(raw_keywords, region)
         candidates = [None] if use_profile else _candidate_accounts(account_id, auto_rotate)
         result = None
         last_error = "采集失败"
@@ -193,7 +196,11 @@ def _run_task_inner(task_id: int, topic: dict, engine: str, max_notes: Optional[
                     _log(f"[driver] {last_error}")
                     continue
                 db.update_account(acc_id, {"last_used_at": int(time.time())})
+            if keywords != raw_keywords:
+                _log(f"[region] 地区={region} OpenCC 繁简扩展：{', '.join(raw_keywords)}"
+                     f" → {', '.join(keywords)}")
             _log(f"[driver] 引擎=Cortech统一采集器（{crawler.title}）话题={topic['name']}"
+                 f" 地区={region}"
                  f"{' 账号=' + acc_name if acc_name else ''}"
                  f"{' [强攻模式]' if aggressive else ''}"
                  f"{' [本地样例]' if collection_fixture_enabled() else ''}"
@@ -228,6 +235,7 @@ def _run_task_inner(task_id: int, topic: dict, engine: str, max_notes: Optional[
                     aggressive=aggressive, account_id=None if use_profile else acc_id,
                     account_name=acc_name, profile_dir=profile_dir,
                     report_progress=_report_progress, should_stop=_should_stop,
+                    region=region,
                 )
 
             try:
@@ -268,6 +276,11 @@ def _run_task_inner(task_id: int, topic: dict, engine: str, max_notes: Optional[
         if _should_stop():
             raise _Cancelled()
         _report_progress(96, "正在入库…")
+        from .xhs_region import detect_script
+        for note in result.notes:
+            note.region = region
+            if not getattr(note, "content_script", ""):
+                note.content_script = detect_script(f"{getattr(note, 'title', '')}\n{getattr(note, 'desc', '')}")
         _log(f"[driver] 采集返回：帖子 {len(result.notes)} 条，评论 {len(result.comments)} 条"
              f"，删除 {getattr(result, 'deleted_count', 0)} 条"
              f"（实际引擎：{engine_used}），开始入库")

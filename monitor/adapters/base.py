@@ -45,6 +45,8 @@ class NoteData:
     media_type: str = ""      # image / video
     note_url: str = ""
     source_keyword: str = ""
+    region: str = "cn"            # cn / hk / overseas
+    content_script: str = ""      # hans / hant / mixed / unknown
 
 
 @dataclass
@@ -82,6 +84,7 @@ class CrawlContext:
     # 进度/停止回调（驱动层注入）
     report_progress: Callable[[int, str], None] = lambda pct, detail: None
     should_stop: Callable[[], bool] = lambda: False
+    region: str = "cn"
 
 
 @dataclass

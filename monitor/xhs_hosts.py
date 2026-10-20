@@ -25,6 +25,8 @@ COOKIE_READ_URLS = (
     "https://www.xiaohongshu.cn",
     "https://www.xiaohongshu.hk",
     "https://edith.xiaohongshu.com",
+    "https://www.rednote.com",
+    "https://webapi.rednote.com",
 )
 
 # 这些注册域上的 Cookie 才算小红书登录态。
@@ -45,8 +47,39 @@ def host_is_xhs(host: str) -> bool:
 
 
 def cookie_preference(domain: str) -> int:
-    """同名 Cookie 时 .com 优先于 .cn、.hk、rednote。"""
+    """同名 Cookie 时 .com 优先于 .cn、.hk、rednote。默认大陆采集用这个顺序。"""
+    return cookie_preference_for_region(domain, "cn")
+
+
+def cookie_preference_for_region(domain: str, region: str = "cn") -> int:
+    """按采集地区决定同名 Cookie 的优先级。
+
+    大陆：.com > .cn > .hk > rednote（与原来一致）。
+    香港：.hk > .com > .cn > rednote。
+    海外 RED：rednote > .com。登录态不跨站共用，所以 rednote 必须压过 .com。
+    """
     text = (domain or "").lower()
+    area = (region or "cn").strip().lower()
+    if area in ("hk", "hongkong", "香港"):
+        if "xiaohongshu.hk" in text:
+            return 5
+        if "xiaohongshu.com" in text:
+            return 4
+        if "xiaohongshu.cn" in text:
+            return 2
+        if "rednote.com" in text:
+            return 0
+        return -1
+    if area in ("overseas", "rednote", "global", "海外"):
+        if "rednote.com" in text:
+            return 5
+        if "xiaohongshu.com" in text:
+            return 2
+        if "xiaohongshu.hk" in text:
+            return 1
+        if "xiaohongshu.cn" in text:
+            return 1
+        return -1
     if "xiaohongshu.com" in text:
         return 3
     if "xiaohongshu.cn" in text:
@@ -58,7 +91,8 @@ def cookie_preference(domain: str) -> int:
     return -1
 
 
-def merge_cookie_rows(rows: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def merge_cookie_rows(rows: Iterable[Dict[str, Any]],
+                      region: str = "cn") -> List[Dict[str, Any]]:
     """合并多域 Cookie。空域名保留；其它域名必须是小红书。同名取偏好更高的。"""
     best: Dict[str, tuple] = {}
     order: List[str] = []
@@ -71,7 +105,7 @@ def merge_cookie_rows(rows: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
         domain = str(row.get("domain") or row.get("host_key") or "")
         if domain and not host_is_xhs(domain):
             continue
-        rank = cookie_preference(domain) if domain else 3
+        rank = cookie_preference_for_region(domain, region) if domain else 3
         prev = best.get(name)
         if prev is None:
             order.append(name)
@@ -81,8 +115,8 @@ def merge_cookie_rows(rows: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return [best[name][1] for name in order]
 
 
-async def collect_context_cookies(ctx) -> List[Dict[str, Any]]:
-    """从 Playwright 上下文读取 .com / .cn / .hk / edith 上会带上的 Cookie。"""
+async def collect_context_cookies(ctx, region: str = "cn") -> List[Dict[str, Any]]:
+    """从 Playwright 上下文读取 .com / .cn / .hk / edith / rednote 上会带上的 Cookie。"""
     rows: List[Dict[str, Any]] = []
     try:
         got = await ctx.cookies(list(COOKIE_READ_URLS))
@@ -96,4 +130,4 @@ async def collect_context_cookies(ctx) -> List[Dict[str, Any]]:
                 continue
             if got:
                 rows.extend(got)
-    return merge_cookie_rows(rows)
+    return merge_cookie_rows(rows, region=region)

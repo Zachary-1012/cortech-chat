@@ -258,6 +258,7 @@ class TopicIn(BaseModel):
     cron: str = Field(default="0 2 * * *")
     enabled: int = Field(default=1, ge=0, le=1)
     engine: str = Field(default="cortech_direct")
+    region: str = Field(default="cn", description="cn 大陆 / hk 香港 / overseas 海外 RED")
 
 
 class TopicPatch(BaseModel):
@@ -268,6 +269,7 @@ class TopicPatch(BaseModel):
     cron: Optional[str] = None
     enabled: Optional[int] = Field(default=None, ge=0, le=1)
     engine: Optional[str] = None
+    region: Optional[str] = None
 
 
 class CrawlIn(BaseModel):
@@ -368,7 +370,7 @@ def api_list_topics():
 def api_create_topic(body: TopicIn):
     topic_id = db.create_topic(body.name, body.keywords, body.max_notes,
                                body.enable_comments, body.cron, body.enabled,
-                               body.engine)
+                               body.engine, body.region)
     scheduler.refresh_jobs()
     return {"id": topic_id}
 
@@ -608,12 +610,13 @@ def api_list_posts(topic_id: Optional[int] = None,
                    q: Optional[str] = None,
                    date_from: Optional[str] = None,
                    date_to: Optional[str] = None,
+                   region: Optional[str] = None,
                    page: int = Query(1, ge=1),
                    page_size: int = Query(20, ge=1, le=100)):
     if sentiment and sentiment not in ("negative", "neutral", "positive"):
         raise HTTPException(400, "sentiment 非法")
     return db.list_posts(topic_id, sentiment, q, page, page_size,
-                         date_from, date_to)
+                         date_from, date_to, region)
 
 
 @app.get("/api/posts/{post_id}/comments")
@@ -626,8 +629,25 @@ def api_list_comments(post_id: str,
 # ---------------- stats / trends / briefing / export ----------------
 
 @app.get("/api/stats")
-def api_stats(topic_id: Optional[int] = None):
-    return db.stats(topic_id)
+def api_stats(topic_id: Optional[int] = None, region: Optional[str] = None):
+    return db.stats(topic_id, region=region)
+
+
+@app.get("/api/xhs/regions")
+def api_xhs_regions():
+    """大陆 / 香港 / 海外 RED 的网页主机、API 主机和语言头。"""
+    from .xhs_region import list_regions
+    return {"items": list_regions()}
+
+
+@app.get("/api/xhs/keywords/expand")
+def api_xhs_expand_keywords(q: str = Query(..., min_length=1),
+                            region: str = Query("hk")):
+    """OpenCC 繁简扩展预览。不访问小红书。"""
+    from .xhs_region import expand_keywords, normalize_region
+    words = [part.strip() for part in q.split(",") if part.strip()]
+    area = normalize_region(region)
+    return {"region": area, "keywords": expand_keywords(words, area)}
 
 
 @app.get("/api/trends")
@@ -640,10 +660,11 @@ def api_trends(topic_id: Optional[int] = None,
 
 @app.get("/api/timeline")
 def api_timeline(topic_id: int,
-                 granularity: str = Query("auto", pattern="^(auto|day|week|month)$")):
+                 granularity: str = Query("auto", pattern="^(auto|day|week|month)$"),
+                 region: Optional[str] = None):
     """话题时间线：按发布时间分档的趋势（方案A：知微式三层）。"""
     from . import timeline
-    return timeline.get_timeline(topic_id, granularity)
+    return timeline.get_timeline(topic_id, granularity, region=region)
 
 
 @app.get("/api/hot-words/detail")
@@ -1415,10 +1436,12 @@ def api_list_influencers(q: Optional[str] = None,
                          domain: Optional[str] = None,
                          coop_status: Optional[str] = None,
                          min_fans: int = Query(0, ge=0),
+                         region: Optional[str] = None,
                          page: int = Query(1, ge=1),
                          page_size: int = Query(20, ge=1, le=100)):
     from . import influencers
-    return influencers.list_influencers(q, domain, coop_status, min_fans, page, page_size)
+    return influencers.list_influencers(q, domain, coop_status, min_fans, page, page_size,
+                                       region)
 
 
 @app.get("/api/influencers/domains")
@@ -1491,12 +1514,27 @@ def api_delete_influencer(author_id: str):
     return {"ok": True}
 
 
+@app.get("/api/influencers/{author_id}/estimate")
+def api_influencer_estimate(author_id: str, region: Optional[str] = None):
+    """达人预估：阅读、曝光、互动率、CPE、CPM、报价、粉丝质量、类目、更新节奏。"""
+    from . import influencers
+    from .influencer_estimates import estimate_author
+    author = influencers.get_influencer(author_id)
+    if not author:
+        raise HTTPException(404, "达人不存在")
+    author["estimate"] = estimate_author(author_id, author, region=region)
+    return author
+
+
 @app.get("/api/influencers/{author_id}/similar")
 def api_similar_influencers(author_id: str,
-                            limit: int = Query(10, ge=1, le=30)):
-    """相似达人推荐（灰豚逆向：/anchor/detail/likeAnchors）。"""
+                            limit: int = Query(10, ge=1, le=30),
+                            region: Optional[str] = None):
+    """相似达人推荐，每条带同一套预估数据。"""
     from . import influencers
-    return {"items": influencers.similar_influencers(author_id, limit)}
+    from .influencer_estimates import FORMULAS
+    return {"items": influencers.similar_influencers(author_id, limit, region=region),
+            "formulas": FORMULAS}
 
 
 @app.get("/api/hotwords/related-brands")
