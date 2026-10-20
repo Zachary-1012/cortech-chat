@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>太古汇小红书舆情监控站</title>
+<title>Cortech Chat</title>
 <style>
   * { box-sizing: border-box; }
   body { font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; margin: 0; background: #f5f6f8; color: #222; }
@@ -50,7 +50,7 @@
 </head>
 <body>
 <header>
-  <h1>🔍 太古汇小红书舆情监控站</h1>
+  <h1>Cortech Chat</h1>
   <span id="loginBadge">登录态检测中…</span>
 </header>
 <main>
@@ -230,7 +230,7 @@ async function loadNotes(p) {
   if ($('q_topic').value) params.set('topic_id', $('q_topic').value);
   if ($('q_sent').value) params.set('sentiment', $('q_sent').value);
   if ($('q_kw').value.trim()) params.set('q', $('q_kw').value.trim());
-  const d = await api('/api/notes?' + params);
+  const d = await api('/api/posts?' + params);
   noteTotal = d.total;
   $('noteBody').innerHTML = d.items.map(n => `<tr class="${n.sentiment==='negative'?'neg':''}">
     <td><span class="tag ${n.sentiment}">${SENT_TXT[n.sentiment]}</span></td>

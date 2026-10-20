@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""主引擎：NanmiCoder/MediaCrawler（vendor，不修改其代码）
+"""浏览器采集引擎：Playwright 打开已登录的小红书页面。
 
 调用方式：子进程 `python main.py --platform xhs --lt qrcode --type search
 --keywords "a,b" --crawler_max_notes_count N --get_comment yes/no
@@ -20,7 +20,8 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from ..config import CORTECH_VENDOR_DIR as VENDOR_DIR, login_cache_dir
+from ..config import (CORTECH_VENDOR_DIR as VENDOR_DIR, active_login_cache_dir,
+                     login_cache_dir)
 from . import register
 from .base import (AdapterNotSupported, AuthorData, CommentData, CrawlContext,
                    CrawlResult, CrawlerAdapter)
@@ -117,20 +118,20 @@ def parse_jsonl_dir(jsonl_dir: Path) -> Tuple[List["NoteData"], List["CommentDat
 
 
 @register
-class MediaCrawlerAdapter(CrawlerAdapter):
+class CortechBrowserAdapter(CrawlerAdapter):
     name = "cortech_browser"
     title = "Cortech浏览器引擎"
-    description = ("NanmiCoder/MediaCrawler：Playwright 浏览器自动化，"
-                   "关键词搜索 + 一级评论采集，扫码登录，JSONL 落盘。")
+    description = ("Playwright 浏览器采集：关键词搜索 + 一级评论，"
+                   "使用本人扫码登录态，结果写入 JSONL。")
     supports_keyword_search = True
     supports_comments = True
     supports_author_info = False
     needs_browser = True
     needs_node = False
-    login_method = "小红书 App 扫码（--lt qrcode），登录态缓存在 vendor/MediaCrawler/xhs_user_data_dir/"
+    login_method = "小红书 App 扫码。登录态写在数据目录的 xhs_login_cache，不要求放在程序目录。"
 
     def check_login(self) -> Tuple[bool, str]:
-        cache = login_cache_dir()
+        cache = active_login_cache_dir()
         ok = cache.exists() and any(cache.iterdir())
         return (ok, "检测到浏览器登录缓存，可直接采集"
                 if ok else "尚未扫码登录：请在「账号管理」页添加账号并扫码登录")
@@ -138,7 +139,7 @@ class MediaCrawlerAdapter(CrawlerAdapter):
     def crawl(self, ctx: CrawlContext) -> CrawlResult:
         from .base import CrawlResult
         if not self.supports_keyword_search:
-            raise AdapterNotSupported("MediaCrawler 不支持关键词搜索")
+            raise AdapterNotSupported("当前浏览器引擎不支持关键词搜索")
         # 多账号：把指定账号的登录态同步到 vendor 缓存目录（单任务锁保证安全）
         if ctx.account_id:
             from ..login_flow import decrypt_profile_to_dir
@@ -148,11 +149,9 @@ class MediaCrawlerAdapter(CrawlerAdapter):
                 cache = login_cache_dir()
                 state = tmpd / "storage_state.json"
                 if state.exists():
-                    # vendor 用完整 profile 目录；这里写入 storage_state 供其启动时加载
-                    # （MediaCrawler 启动会读取该目录的登录态）
                     cache.mkdir(parents=True, exist_ok=True)
                     shutil.copy(state, cache / "storage_state.json")
-                    ctx.log(f"[mediacrawler] 已切换到账号「{ctx.account_name}」的登录态")
+                    ctx.log(f"[cortech-browser] 已切换到账号「{ctx.account_name}」的登录态")
             shutil.rmtree(tmpd, ignore_errors=True)
         cmd = [
             sys.executable, "main.py",

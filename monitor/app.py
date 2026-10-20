@@ -15,14 +15,15 @@ from pydantic import BaseModel, Field
 
 from . import ai_chat, bid, crawler_driver, creator, db, email_verify, influence, reports, scheduler, site, trends
 from .adapters import adapter_names, get_adapter, list_adapters
-from .config import (BASE_DIR, DATA_DIR, STATIC_DIR, _is_placeholder, ensure_dirs,
-                     get_ai_config, login_cache_dir, public_ai_config, save_ai_config)
+from .config import (BASE_DIR, DATA_DIR, STATIC_DIR, _is_placeholder, bind_host,
+                     bind_port, ensure_dirs, get_ai_config, login_cache_dir,
+                     public_ai_config, save_ai_config)
 from .site import DynamicCORSMiddleware
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("xhs-monitor.app")
 
-app = FastAPI(title="Chat Cortech", version="2.0.0")
+app = FastAPI(title="Cortech Chat", version="2.0.0")
 app.add_middleware(DynamicCORSMiddleware)  # 动态 CORS：保存域名后即时生效
 
 
@@ -57,7 +58,8 @@ class AuthMiddleware(BaseHTTPMiddleware):
 
     async def dispatch(self, request: Request, call_next):
         path = request.url.path
-        if not path.startswith("/api/") or path.startswith("/api/auth/"):
+        if (not path.startswith("/api/") or path.startswith("/api/auth/")
+                or path == "/api/setup/status"):
             return await call_next(request)
         uid = None
         token = request.cookies.get(SESSION_COOKIE)
@@ -99,6 +101,19 @@ def _check_email(email: str) -> str:
     if len(email) > 120:
         raise HTTPException(400, "邮箱过长")
     return email
+
+
+@app.get("/api/setup/status")
+def api_setup_status(request: Request):
+    """公开自检：库、数据目录、登录组件、当前用户是否已有小红书账号。"""
+    from .setup_status import build_setup_status
+    uid = None
+    token = request.cookies.get(SESSION_COOKIE)
+    if token:
+        user = db.get_session_user(token)
+        if user:
+            uid = user["id"]
+    return build_setup_status(uid)
 
 
 @app.get("/api/auth/status")
@@ -367,9 +382,25 @@ def api_trigger_crawl(topic_id: int, body: CrawlIn = CrawlIn()):
             enable_comments=body.enable_comments,
             account_id=body.account_id, aggressive=body.aggressive)
     except ValueError as e:
-        raise HTTPException(400, str(e))
-    return {"task_id": task_id, "engine": engine,
-            "account_id": body.account_id, "aggressive": body.aggressive}
+        message = str(e)
+        code = "need_xhs_session" if "need_xhs_session" in message else (
+            "need_xhs_rescan" if "need_xhs_rescan" in message else "crawl_rejected")
+        return JSONResponse(status_code=400, content={
+            "detail": message,
+            "code": code,
+            "message": message,
+            "needs_real_xhs_session": code.startswith("need_xhs"),
+        })
+    from .config import collection_fixture_enabled
+    task = db.get_task(task_id) or {}
+    if collection_fixture_enabled():
+        message = "已启动本地样例采集。这不是真实小红书会话，真实采集仍需本人扫码。"
+    else:
+        message = "采集任务已开始。"
+    return {"task_id": task_id, "engine": "cortech_crawler",
+            "account_id": task.get("account_id"), "aggressive": body.aggressive,
+            "needs_real_xhs_session": False,
+            "message": message}
 
 
 # ---------------- 话题全量采集（tag 扩展 + 一次性深采） ----------------
@@ -1526,27 +1557,14 @@ def api_check_account(account_id: int):
     acc = db.get_account(account_id)
     if not acc:
         raise HTTPException(404, "账号不存在")
-    if not acc.get("login_data_enc"):
-        db.update_account(account_id, {"status": "expired",
-                                       "check_note": "无登录数据，请重新扫码"})
-        return {"ok": False, "status": "expired", "message": "无登录数据，请重新扫码"}
-    # 轻量验证：解密后尝试读取 Cookie
-    try:
-        from .account_crypto import decrypt_login_data
-        import json
-        state = json.loads(decrypt_login_data(acc["login_data_enc"]))
-        cookies = {c["name"]: c["value"]
-                   for c in state.get("cookies", [])}
-        ok = bool(cookies.get("web_session") and cookies.get("a1"))
-    except Exception:  # noqa: BLE001
-        ok = False
+    from .login_flow import account_health
+    health = account_health(acc)
     db.update_account(account_id, {
-        "status": "valid" if ok else "expired",
+        "status": health["status"],
         "last_check_at": int(__import__("time").time()),
-        "check_note": "登录态有效" if ok else "Cookie 缺少 a1/web_session，请重新扫码",
+        "check_note": health["message"][:180],
     })
-    return {"ok": ok, "status": "valid" if ok else "expired",
-            "message": "登录态有效" if ok else "登录失效，请重新扫码"}
+    return health
 
 
 @app.get("/api/login/qrcode")
@@ -1602,6 +1620,31 @@ def api_login_cancel(account_id: int):
 
 # ---------------- login status ----------------
 
+@app.get("/api/accounts/cookie-handshake")
+def api_cookie_handshake_status():
+    """是否允许用户主动提交本人 Cookie。默认关闭，不返回任何 Cookie。"""
+    from .cookie_handshake import status
+    return status()
+
+
+class CookieHandshakeIn(BaseModel):
+    a1: str = ""
+    web_session: str = ""
+    nickname: str = ""
+
+
+@app.post("/api/accounts/cookie-handshake")
+def api_cookie_handshake(body: CookieHandshakeIn):
+    """仅在功能开关打开时，保存用户本人粘贴的 a1 与 web_session。"""
+    from .cookie_handshake import HandshakeDisabled, HandshakeRejected, accept_user_cookies
+    try:
+        return accept_user_cookies(body.a1, body.web_session, body.nickname)
+    except HandshakeDisabled as e:
+        raise HTTPException(404, str(e))
+    except HandshakeRejected as e:
+        raise HTTPException(400, str(e))
+
+
 @app.get("/api/login-status")
 def api_login_status():
     """检测各引擎登录态"""
@@ -1611,10 +1654,16 @@ def api_login_status():
         engines.append({"name": a.name, "title": a.title,
                         "login_ok": ok, "login_hint": hint})
     accounts = db.list_accounts()
+    valid = [a for a in accounts if a.get("status") == "valid"]
     return {
         "engines": engines,
         "accounts": accounts,
-        "default_account_id": (db.get_default_account() or {}).get("id"),
+        "default_account_id": (db.next_collection_account() or {}).get("id"),
+        "needs_real_xhs_session": not bool(valid),
+        "message": (
+            "已有可采集的小红书登录态。" if valid else
+            "需要真实小红书登录态：请用本人账号扫码。服务端不能代替这一步。"
+        ),
         # 账号安全建议（用户已指定香港号为采集账号）
         "account_advice": (
             "建议使用专用采集账号（如你的香港号），不要用运营主号登录采集，"
@@ -1987,11 +2036,9 @@ def spa_fallback(path: str):
 
 
 def main() -> None:
-    import os
-
     import uvicorn
-    host = os.environ.get("XHS_HOST", "127.0.0.1")
-    port = int(os.environ.get("XHS_PORT", "8000"))
+    host, port = bind_host(), bind_port()
+    logger.info("Cortech Chat 监听 %s:%s 数据目录 %s", host, port, DATA_DIR)
     uvicorn.run("monitor.app:app", host=host, port=port)
 
 

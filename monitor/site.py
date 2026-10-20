@@ -21,7 +21,7 @@ import time
 from pathlib import Path
 from typing import Dict, List, Optional
 
-from .config import BASE_DIR, DATA_DIR, ensure_dirs
+from .config import BASE_DIR, DATA_DIR, bind_port, ensure_dirs
 from .netutil import http_client, public_ip
 
 logger = logging.getLogger("xhs-monitor.site")
@@ -45,7 +45,7 @@ def validate_domain(domain: str) -> str:
 def get_site_config() -> Dict:
     ensure_dirs()
     cfg = {"domain": "", "cors_origins": [], "api_base": "/api",
-           "backend_port": int(os.environ.get("XHS_PORT", "8000")),
+           "backend_port": bind_port(),
            # 品牌档案（通用化：网站是通用的，品牌只是配置项）
            # 默认值为通用示例，换品牌时在设置页修改即可，无需改代码
            "brand_name": "示例品牌",
