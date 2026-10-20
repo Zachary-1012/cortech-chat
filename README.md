@@ -62,6 +62,15 @@ export CORTECH_SAAS=1
 
 这样本人 Cookie 握手默认开启。若要关掉，显式写 `CORTECH_ENABLE_COOKIE_HANDSHAKE=0`。
 
+负载均衡探活用 `GET /health`（也可用 `GET /api/health`）。`GET /api/setup/status` 在带登录 Cookie 时返回本账号的：登录组件是否就绪、健康小红书账号数、是否已有话题、最近一次采集状态。
+
+**样例闭环与真实会话**
+
+- 样例：`CORTECH_COLLECTION_FIXTURE=1` 后，对话题点采集。任务进度会走到 100，帖子列表和总览出现本地样例。服务不会访问小红书。
+- 真实会话：关掉该开关。在「账号管理」用本人小红书扫码，或用浏览器插件确认后发送自己的登录态。没有有效登录态时，采集返回 `need_xhs_session`，不会编造笔记。
+
+域名上线的容器和主机样例在 [`deploy/README.md`](deploy/README.md)：`docker compose`，或 systemd + nginx（证书路径是占位符）。数据目录放在镜像外面。使用网页的人不用在自己的 Windows 上安装 Python 依赖。
+
 域名接入仍可用「设置」里的站点配置生成 nginx 样例。证书和 DNS 需要你在域名服务商处完成。
 
 ### 浏览器插件：把自己的小红书登录态发给 Cortech Chat

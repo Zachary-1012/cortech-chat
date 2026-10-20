@@ -26,7 +26,7 @@ def _build_system_prompt() -> str:
     names = [t["name"] for t in db.list_topics()[:10]]
     topics_text = "、".join(names) if names else "（暂无话题）"
     features_text = ai_knowledge.knowledge_text()
-    return f"""你是 Chat Cortech，一个帮用户干活的真人助理。用户说什么，你就做什么。
+    return f"""你是 Cortech Chat，一个帮用户干活的真人助理。用户说什么，你就做什么。
 
 规矩只有两条：
 1. 不要编造数据。查不到就说查不到，不要猜。

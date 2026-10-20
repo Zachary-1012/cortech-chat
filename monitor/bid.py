@@ -364,7 +364,7 @@ def build_report() -> Dict[str, Any]:
     return {
         "report_no": no,
         "type": "比稿评审报告",
-        "product": "Chat Cortech",
+        "product": "Cortech Chat",
         "generated_at": _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "conclusion": conclusion,
         "table": [

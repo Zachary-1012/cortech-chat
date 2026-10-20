@@ -124,7 +124,7 @@ def save_brand(name: str, short: str) -> Dict[str, str]:
     return get_brand()
 
 
-NGINX_TEMPLATE = """# 由 Chat Cortech 自动生成（{domain}），{ts}
+NGINX_TEMPLATE = """# 由 Cortech Chat 自动生成（{domain}），{ts}
 # 用法：sudo cp {conf_name} /etc/nginx/sites-available/ && \\
 #       sudo ln -s /etc/nginx/sites-available/{conf_name} /etc/nginx/sites-enabled/ && \\
 #       sudo nginx -t && sudo systemctl reload nginx

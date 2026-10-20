@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Chat Cortech · Windows 桌面客户端
+"""Cortech Chat · Windows 桌面客户端
 
 一个双击即用的桌面版入口，等价于「本地服务 + 应用窗口」：
 
@@ -185,16 +185,16 @@ def stop_server(proc: subprocess.Popen) -> None:
 
 def main() -> int:
     log("=" * 56)
-    log("Chat Cortech 桌面客户端启动中…")
+    log("Cortech Chat 桌面客户端启动中…")
 
     if not (ROOT / "monitor" / "app.py").exists():
-        notify("Chat Cortech 启动失败",
+        notify("Cortech Chat 启动失败",
                f"未找到 monitor/app.py，请确认启动器位于项目根目录：\n{ROOT}")
         return 1
     if not LIBS.exists():
         log("提示：未发现内置依赖目录 libs/，将使用系统已安装的 Python 依赖")
         if not preflight():
-            notify("Chat Cortech 启动失败",
+            notify("Cortech Chat 启动失败",
                    f"依赖不完整。\n请执行：python -m pip install -r monitor/requirements.txt\n\n"
                    f"详细日志：{LOG_FILE}")
             return 1
@@ -210,7 +210,7 @@ def main() -> int:
         log(f"后台服务已拉起（PID {server.pid}），等待就绪…")
         if not wait_for_server(server):
             stop_server(server)
-            notify("Chat Cortech 启动失败",
+            notify("Cortech Chat 启动失败",
                    f"后台服务未能就绪，请查看日志：\n{LOG_FILE}")
             return 1
         log(f"服务就绪：{URL}")
@@ -229,7 +229,7 @@ def main() -> int:
     finally:
         if server is not None:
             stop_server(server)
-        log("Chat Cortech 已退出")
+        log("Cortech Chat 已退出")
     return 0
 
 

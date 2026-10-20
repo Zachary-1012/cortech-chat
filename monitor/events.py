@@ -395,10 +395,12 @@ def get_event(event_id: int) -> Optional[Dict[str, Any]]:
         notes: List[Dict[str, Any]] = []
         if note_ids:
             q = ",".join("?" * len(note_ids))
+            note_sql, note_params = db.uid_sql()
             notes = [dict(r) for r in conn.execute(
                 "SELECT post_id, title, author, publish_time, liked_count,"
-                f" comment_count, sentiment, note_url FROM notes WHERE post_id IN ({q})",
-                note_ids,
+                f" comment_count, sentiment, note_url FROM notes WHERE post_id IN ({q})"
+                f"{note_sql}",
+                (*note_ids, *note_params),
             ).fetchall()]
         notes.sort(key=_engagement, reverse=True)
         ev["key_notes"] = notes[:8]

@@ -1,10 +1,10 @@
 @echo off
 chcp 65001 >nul
 cd /d "%~dp0"
-title Chat Cortech · 停止
+title Cortech Chat · 停止
 
 echo.
-echo   Chat Cortech · 正在停止后台服务...
+echo   Cortech Chat · 正在停止后台服务...
 echo.
 
 powershell -NoProfile -ExecutionPolicy Bypass -Command ^

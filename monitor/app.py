@@ -80,7 +80,7 @@ class AuthMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         path = request.url.path
         if (not path.startswith("/api/") or path.startswith("/api/auth/")
-                or path == "/api/setup/status"):
+                or path in ("/api/setup/status", "/api/health")):
             return await call_next(request)
         uid = None
         token = _session_token(request)
@@ -101,8 +101,11 @@ app.add_middleware(AuthMiddleware)
 
 
 def _set_session_cookie(resp: JSONResponse, token: str) -> None:
+    import os
+    secure = (os.environ.get("CORTECH_COOKIE_SECURE") or "").strip().lower() in (
+        "1", "true", "yes", "on")
     resp.set_cookie(SESSION_COOKIE, token, max_age=db.SESSION_TTL,
-                    httponly=True, samesite="lax", path="/")
+                    httponly=True, samesite="lax", secure=secure, path="/")
 
 
 class AuthBody(BaseModel):
@@ -124,17 +127,27 @@ def _check_email(email: str) -> str:
     return email
 
 
+def _optional_user_id(request: Request) -> Optional[int]:
+    token = _session_token(request)
+    if not token:
+        return None
+    user = db.get_session_user(token)
+    return user["id"] if user else None
+
+
+@app.get("/health")
+@app.get("/api/health")
+def api_health():
+    """负载均衡探活。不返回租户数据。"""
+    from .config import saas_mode
+    return {"ok": True, "product": "Cortech Chat", "saas": saas_mode()}
+
+
 @app.get("/api/setup/status")
 def api_setup_status(request: Request):
-    """公开自检：库、数据目录、登录组件、当前用户是否已有小红书账号。"""
+    """自检：登录组件、本账号健康的小红书数、是否已有话题、最近一次采集。"""
     from .setup_status import build_setup_status
-    uid = None
-    token = _session_token(request)
-    if token:
-        user = db.get_session_user(token)
-        if user:
-            uid = user["id"]
-    return build_setup_status(uid)
+    return build_setup_status(_optional_user_id(request))
 
 
 @app.get("/api/auth/status")
@@ -1109,12 +1122,48 @@ def api_tiered_alerts(topic_id: Optional[int] = None):
     return analysis.tiered_alerts(topic_id)
 
 
+class AlertIn(BaseModel):
+    level: str = "yellow"
+    title: str = Field(min_length=1, max_length=200)
+    message: str = ""
+    topic_id: Optional[int] = None
+    post_ids: List[str] = Field(default_factory=list)
+    link: str = ""
+
+
 @app.get("/api/alerts")
 def api_list_alerts(status: Optional[str] = None, level: Optional[str] = None,
                     limit: int = Query(50, ge=1, le=200),
                     offset: int = Query(0, ge=0)):
     from . import alerts
-    return {"items": alerts.list_alerts(status, level, limit, offset)}
+    return alerts.list_alerts(status, level, limit, offset)
+
+
+@app.post("/api/alerts")
+def api_create_alert(body: AlertIn):
+    from . import alerts
+    level = (body.level or "yellow").strip()
+    if level not in ("red", "orange", "yellow", "critical", "high", "medium"):
+        raise HTTPException(400, "level 非法")
+    aid = alerts.create_alert(level, body.title.strip(), body.message or "",
+                              topic_id=body.topic_id, post_ids=body.post_ids,
+                              link=body.link or "")
+    created = alerts.get_alert(aid)
+    if not created:
+        raise HTTPException(500, "预警写入失败")
+    return created
+
+
+@app.get("/api/alerts/export.csv")
+@app.get("/api/export/alerts.csv")
+def api_export_alerts(status: Optional[str] = None, level: Optional[str] = None):
+    from . import alerts
+    fname, text = alerts.export_alerts_csv(status, level)
+    return StreamingResponse(
+        iter([text.encode("utf-8")]),
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": _content_disposition(fname)},
+    )
 
 
 @app.get("/api/alerts/unread_count")
@@ -1171,6 +1220,14 @@ def api_alert_status(alert_id: int, body: dict):
     if not alerts.set_alert_status(alert_id, st):
         raise HTTPException(404, "预警不存在")
     return {"ok": True}
+
+
+@app.post("/api/alerts/{alert_id}/read")
+def api_alert_mark_read(alert_id: int):
+    from . import alerts
+    if not alerts.mark_read(alert_id):
+        raise HTTPException(404, "预警不存在")
+    return alerts.get_alert(alert_id)
 
 
 @app.post("/api/alerts/{alert_id}/push")

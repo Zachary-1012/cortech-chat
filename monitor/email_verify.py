@@ -79,21 +79,21 @@ def send_code(email: str) -> Tuple[bool, str]:
         return True, "验证码已发送，请查收邮件"
     # 开发模式：控制台打印
     log.warning("[开发模式] %s 的注册验证码：%s（10 分钟内有效）", email, code)
-    print(f"[Chat Cortech] {email} 的注册验证码：{code}（10 分钟内有效，SMTP 未配置）",
+    print(f"[Cortech Chat] {email} 的注册验证码：{code}（10 分钟内有效，SMTP 未配置）",
           flush=True)
     return True, "验证码已生成（开发模式：请查看服务端控制台）"
 
 
 def _send_smtp(email: str, code: str) -> Tuple[bool, str]:
     c = _smtp_conf()
-    subject = "Chat Cortech 注册验证码"
+    subject = "Cortech Chat 注册验证码"
     body = (f"您的注册验证码是：{code}\n\n"
             f"10 分钟内有效，请勿泄露给他人。\n"
-            f"—— Chat Cortech")
+            f"—— Cortech Chat")
     try:
         msg = MIMEText(body, "plain", "utf-8")
         msg["Subject"] = subject
-        msg["From"] = formataddr(("Chat Cortech", c["from"]))
+        msg["From"] = formataddr(("Cortech Chat", c["from"]))
         msg["To"] = email
         if c["use_ssl"]:
             server = smtplib.SMTP_SSL(c["host"], c["port"], timeout=20)

@@ -1,0 +1,25 @@
+# Cortech Chat systemd 单元
+# 安装：
+#   sudo cp deploy/cortech-chat.service /etc/systemd/system/cortech-chat.service
+#   sudo cp deploy/env.production.example /etc/cortech-chat.env
+#   sudo systemctl daemon-reload && sudo systemctl enable --now cortech-chat
+#
+# 把下面的路径改成服务器上的检出目录。依赖装在服务器的 venv 里，
+# 打开网页的人不用在自己的 Windows 上安装。
+
+[Unit]
+Description=Cortech Chat
+After=network.target
+
+[Service]
+Type=simple
+User=cortech
+Group=cortech
+WorkingDirectory=/opt/cortech-chat
+EnvironmentFile=/etc/cortech-chat.env
+ExecStart=/opt/cortech-chat/.venv/bin/python -m monitor.app
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

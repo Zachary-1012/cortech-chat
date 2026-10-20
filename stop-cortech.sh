@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Chat Cortech · Linux / macOS 停止脚本
+# Cortech Chat · Linux / macOS 停止脚本
 set -uo pipefail
 
 if ! command -v pkill >/dev/null 2>&1; then
@@ -8,7 +8,7 @@ if ! command -v pkill >/dev/null 2>&1; then
 fi
 
 if pkill -f "monitor.app"; then
-  echo "已停止 Chat Cortech。"
+  echo "已停止 Cortech Chat。"
 else
-  echo "没有正在运行的 Chat Cortech 服务。"
+  echo "没有正在运行的 Cortech Chat 服务。"
 fi

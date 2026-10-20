@@ -24,6 +24,9 @@ monitor/.env
 
 # ---------------- 日志 ----------------
 *.log
+
+# 插件 zip 由 extensions/build-zip.sh 生成
+extensions/*.zip
 logs/
 
 # ---------------- 前端 ----------------

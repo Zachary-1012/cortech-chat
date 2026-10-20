@@ -181,13 +181,15 @@ def crawl_competitor(cid: int, account_id: Optional[int] = None,
 
 def _top_posts(topic_id: int, days: int, limit: int = 5) -> List[Dict[str, Any]]:
     s, e = _day_bounds(days)
+    extra, extra_p = db.uid_sql()
     with _connect() as conn:
         rows = conn.execute(
             "SELECT post_id, title, author, liked_count, comment_count, note_url,"
             " sentiment, publish_time FROM notes"
             " WHERE topic_id=? AND publish_time>=? AND publish_time<=?"
+            f"{extra}"
             " ORDER BY (liked_count + comment_count * 3) DESC LIMIT ?",
-            (topic_id, s, e, limit)).fetchall()
+            (topic_id, s, e, *extra_p, limit)).fetchall()
     return [dict(r) for r in rows]
 
 
