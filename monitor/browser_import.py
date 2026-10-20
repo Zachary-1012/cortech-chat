@@ -178,6 +178,8 @@ def _read_profile_cookie_rows(user_data_dir: Path,
                 "SELECT host_key, name, encrypted_value, value, path, expires_utc,"
                 " is_secure, is_httponly, samesite FROM cookies"
                 " WHERE host_key LIKE '%xiaohongshu.com'"
+                " OR host_key LIKE '%xiaohongshu.cn'"
+                " OR host_key LIKE '%xiaohongshu.hk'"
                 " OR host_key LIKE '%rednote.com'"
             ).fetchall()
         finally:
@@ -236,9 +238,10 @@ def _to_storage_state(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
 # ---------------- 账号信息识别（只读 selfinfo） ----------------
 
 def _cookie_dict(rows: List[Dict[str, Any]]) -> Dict[str, str]:
-    """Cookie 行 → name/value 字典；同名时优先 xiaohongshu.com（与采集器口径一致）"""
-    ordered = sorted(rows, key=lambda r: "xiaohongshu.com" in r["host_key"])
-    return {r["name"]: r["value"] for r in ordered}
+    """Cookie 行 → name/value。同名时 .com 优先于 .cn / .hk / rednote。"""
+    from .xhs_hosts import merge_cookie_rows
+    merged = merge_cookie_rows(rows)
+    return {r["name"]: r["value"] for r in merged}
 
 async def _fetch_self_info(cookie_dict: Dict[str, str]) -> Dict[str, str]:
     """用 Cookie 调一次 selfinfo 拿昵称/头像/uid（只读，不做任何写操作）"""

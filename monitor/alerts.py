@@ -421,11 +421,23 @@ def get_alert(alert_id: int) -> Optional[Dict[str, Any]]:
                 note_sql, note_params = " AND user_id=?", (uid,)
             nrows = conn.execute(
                 f"SELECT post_id,title,author,liked_count,collected_count,"
-                f"comment_count,share_count,sentiment,note_url,publish_time,post_status"
+                f"comment_count,share_count,share_count_available,sentiment,"
+                f"note_url,publish_time,collected_at,post_status,field_meta"
                 f" FROM notes WHERE post_id IN ({ph}){note_sql}",
                 (*post_ids, *note_params),
             ).fetchall()
-            notes = [dict(n) for n in nrows]
+            notes = []
+            for n in nrows:
+                item = dict(n)
+                raw_meta = item.get("field_meta") or ""
+                if isinstance(raw_meta, str) and raw_meta:
+                    try:
+                        item["field_meta"] = json.loads(raw_meta)
+                    except Exception:
+                        item["field_meta"] = {}
+                elif not isinstance(raw_meta, dict):
+                    item["field_meta"] = {}
+                notes.append(item)
         alert["notes"] = notes
         logs = conn.execute(
             "SELECT * FROM alert_push_log WHERE alert_id=? ORDER BY created_at DESC",
@@ -531,8 +543,10 @@ def _task_window_notes(conn: sqlite3.Connection, topic_id: int,
                        start_ts: int, end_ts: int) -> List[Dict[str, Any]]:
     """本轮采集入库的帖子（按采集时间落在任务窗口内）。"""
     sql = ("SELECT post_id,title,desc,author,liked_count,collected_count,"
-           "comment_count,share_count,sentiment,note_url,publish_time,collected_at"
-           " FROM notes WHERE topic_id=? AND collected_at>=? AND collected_at<=?")
+           "comment_count,share_count,share_count_available,sentiment,note_url,"
+           "publish_time,collected_at,post_status,field_meta"
+           " FROM notes WHERE topic_id=? AND collected_at>=? AND collected_at<=?"
+           " AND IFNULL(post_status,'active')!='deleted'")
     params: List[Any] = [topic_id, start_ts, end_ts]
     uid = current_user_id()
     if uid is not None:
@@ -601,8 +615,8 @@ def _eval_hot_post(rule: Dict[str, Any],
     for n in notes:
         if n.get("sentiment") != "negative":
             continue
-        eng = (n.get("liked_count", 0) or 0) + (n.get("collected_count", 0) or 0) \
-            + (n.get("comment_count", 0) or 0) + (n.get("share_count", 0) or 0)
+        from .xhs_errors import engagement_of
+        eng, _parts = engagement_of(n)
         if eng >= th:
             cands.append((eng, n))
     if not cands:
@@ -610,12 +624,11 @@ def _eval_hot_post(rule: Dict[str, Any],
     cands.sort(key=lambda x: x[0], reverse=True)
     cands = cands[: int(p.get("max_notes", 5))]
     eng, top = cands[0]
+    from .xhs_errors import engagement_of
+    _eng, parts = engagement_of(top)
     title = f"高热负面单帖：{top.get('title') or '（无标题）'}"[:60]
     summary = (f"「{top.get('title') or '（无标题）'}」作者 {top.get('author') or '-'}，"
-               f"互动量 {eng}（点赞{top.get('liked_count', 0)}/"
-               f"收藏{top.get('collected_count', 0)}/"
-               f"评论{top.get('comment_count', 0)}/分享{top.get('share_count', 0)}），"
-               f"超过阈值 {th}。")
+               f"互动量 {eng}（{parts}），超过阈值 {th}。")
     return (rule["level"], title, summary,
             [n["post_id"] for _, n in cands], top.get("note_url") or "")
 

@@ -22,9 +22,84 @@ from . import db
 from .account_crypto import decrypt_login_data, encrypt_login_data
 from .config import login_cache_dir
 
-# 会话状态：idle/starting/waiting/success/expired/failed/cancelled
+# 会话内部状态：idle/starting/waiting/success/expired/failed/cancelled
+# 接口对外只暴露 waiting / success / expired / need_rescan，并带中文说明。
+PUBLIC_LOGIN_STATES = ("waiting", "success", "expired", "need_rescan")
+STATE_LABELS = {
+    "waiting": "等待扫码",
+    "success": "登录成功",
+    "expired": "二维码已过期",
+    "need_rescan": "需要重新扫码",
+}
+_SESSION_STATE = {
+    "idle": "need_rescan",
+    "starting": "waiting",
+    "waiting": "waiting",
+    "success": "success",
+    "expired": "expired",
+    "failed": "need_rescan",
+    "cancelled": "need_rescan",
+}
+_ACCOUNT_STATE = {
+    "valid": "success",
+    "pending": "waiting",
+    "expired": "need_rescan",
+}
+
 _manager = None
 _manager_lock = threading.Lock()
+# 测试可关掉，避免扫码流程拉起浏览器。
+_launch_browser = True
+
+
+def set_launch_browser(enabled: bool) -> None:
+    """单测关闭后，登录会话停在等待扫码，不启动 Playwright。"""
+    global _launch_browser
+    _launch_browser = bool(enabled)
+
+
+def launch_browser_enabled() -> bool:
+    return _launch_browser
+
+
+def login_state_payload(account_id, state: str, message: str, *,
+                        status: str = "", ok: Optional[bool] = None,
+                        has_qrcode: bool = False, elapsed: int = 0) -> Dict:
+    """登录 / 二维码 / 重扫接口共用的状态。"""
+    if state not in STATE_LABELS:
+        state = "need_rescan"
+    if ok is None:
+        ok = state == "success"
+    return {
+        "account_id": account_id,
+        "status": status or state,
+        "state": state,
+        "state_label": STATE_LABELS[state],
+        "message": message or STATE_LABELS[state],
+        "ok": bool(ok),
+        "has_qrcode": bool(has_qrcode),
+        "elapsed": int(elapsed),
+    }
+
+
+def account_state_payload(acc: Optional[dict]) -> Dict:
+    """没有进行中的扫码会话时，用账号表上的状态。"""
+    if not acc:
+        return login_state_payload(
+            None, "need_rescan", "账号不存在", status="idle", ok=False)
+    status = acc.get("status") or "pending"
+    state = _ACCOUNT_STATE.get(status, "need_rescan")
+    note = (acc.get("check_note") or "").strip()
+    if note:
+        message = note
+    elif state == "waiting":
+        message = "请用小红书 App 扫码登录（120 秒内有效）"
+    elif state == "success":
+        message = "登录成功"
+    else:
+        message = "需要重新扫码。请在「账号管理」用本人小红书账号再次登录。"
+    return login_state_payload(
+        acc.get("id"), state, message, status=status, ok=state == "success")
 
 
 class LoginSession:
@@ -35,19 +110,33 @@ class LoginSession:
         self.qrcode_b64: str = ""  # 纯 base64（无 data: 前缀），前端拼 data:image/png;base64,
         self.started_at = time.time()
         self._stop = threading.Event()
-        self._thread = threading.Thread(target=self._run, daemon=True)
-        self._thread.start()
+        self._thread = None
+        if _launch_browser:
+            self._thread = threading.Thread(target=self._run, daemon=True)
+            self._thread.start()
+        else:
+            self.status = "waiting"
+            self.message = "请用小红书 App 扫码登录（120 秒内有效）"
 
     # ---------- 对外查询 ----------
 
     def snapshot(self) -> Dict:
-        return {
-            "account_id": self.account_id,
-            "status": self.status,
-            "message": self.message,
-            "has_qrcode": bool(self.qrcode_b64),
-            "elapsed": int(time.time() - self.started_at),
-        }
+        state = _SESSION_STATE.get(self.status, "need_rescan")
+        return login_state_payload(
+            self.account_id, state, self.message, status=self.status,
+            has_qrcode=bool(self.qrcode_b64),
+            elapsed=int(time.time() - self.started_at),
+        )
+
+    def mark(self, status: str, message: Optional[str] = None,
+             qrcode_b64: Optional[str] = None) -> Dict:
+        """测试或外部驱动推进状态机，不碰浏览器。"""
+        self.status = status
+        if message is not None:
+            self.message = message
+        if qrcode_b64 is not None:
+            self.qrcode_b64 = qrcode_b64
+        return self.snapshot()
 
     def cancel(self):
         self._stop.set()
@@ -139,10 +228,12 @@ class LoginSession:
         return ""
 
     async def _web_session(self, ctx) -> str:
+        """登录成功看 web_session。www 之外，.cn / .hk / edith 上的同名 Cookie 也算。"""
         try:
-            cookies = await ctx.cookies("https://www.xiaohongshu.com")
+            from .xhs_hosts import collect_context_cookies
+            cookies = await collect_context_cookies(ctx)
             for c in cookies:
-                if c["name"] == "web_session":
+                if c.get("name") == "web_session" and c.get("value"):
                     return c["value"]
         except Exception:  # noqa: BLE001
             pass
@@ -167,7 +258,6 @@ class LoginSession:
 
     async def _save_login_state(self, ctx, page):
         state_json = await ctx.storage_state()
-        state_str = json.dumps(state_json, ensure_ascii=False)
         # 提取昵称/用户ID
         nickname, user_id, avatar = "", "", ""
         try:
@@ -179,24 +269,10 @@ class LoginSession:
             nickname = (await el.inner_text() or "").strip()
         except Exception:  # noqa: BLE001
             pass
-        db.update_account(self.account_id, {
-            "nickname": nickname or f"小红书账号{self.account_id}",
-            "xhs_user_id": user_id,
-            "avatar_url": avatar,
-            "status": "valid",
-            "login_data_enc": encrypt_login_data(state_str),
-            "last_check_at": int(time.time()),
-            "check_note": "扫码登录成功",
-        })
-        # 同时写入登录缓存目录，保证统一采集器复用
-        try:
-            cache = login_cache_dir()
-            cache.mkdir(parents=True, exist_ok=True)
-            (cache / "storage_state.json").write_text(state_str, encoding="utf-8")
-        except Exception:  # noqa: BLE001
-            pass
-        self.status = "success"
-        self.message = f"登录成功：{nickname or '小红书账号'}"
+        apply_successful_login(
+            self.account_id, state_json,
+            nickname=nickname, xhs_user_id=user_id, avatar_url=avatar,
+        )
 
 
 def get_manager() -> "_LoginManager":
@@ -221,14 +297,15 @@ class _LoginManager:
             self._sessions[account_id] = sess
             return sess.snapshot()
 
+    def get_session(self, account_id: int) -> Optional[LoginSession]:
+        with self._lock:
+            return self._sessions.get(account_id)
+
     def status(self, account_id: int) -> Dict:
         with self._lock:
             sess = self._sessions.get(account_id)
         if not sess:
-            acc = db.get_account(account_id)
-            return {"account_id": account_id,
-                    "status": acc["status"] if acc else "idle",
-                    "message": "", "has_qrcode": False, "elapsed": 0}
+            return account_state_payload(db.get_account(account_id))
         return sess.snapshot()
 
     def qrcode(self, account_id: int) -> Optional[str]:
@@ -242,7 +319,54 @@ class _LoginManager:
         if sess:
             sess.cancel()
             return sess.snapshot()
-        return {"account_id": account_id, "status": "idle"}
+        return login_state_payload(account_id, "need_rescan", "已取消，需要重新扫码",
+                                   status="idle", ok=False)
+
+    def clear(self, account_id: int) -> None:
+        with self._lock:
+            self._sessions.pop(account_id, None)
+
+    def clear_all(self) -> None:
+        with self._lock:
+            for sess in self._sessions.values():
+                sess.cancel()
+            self._sessions.clear()
+
+
+def _finish_health(payload: dict) -> dict:
+    state = "success" if payload.get("ok") else "need_rescan"
+    payload["state"] = state
+    payload["state_label"] = STATE_LABELS[state]
+    return payload
+
+
+def apply_successful_login(account_id: int, storage_state: dict, *,
+                           nickname: str = "", xhs_user_id: str = "",
+                           avatar_url: str = "") -> Dict:
+    """扫码成功后的落库。账号变为 valid，进行中的会话变为 success。"""
+    nickname = (nickname or "").strip()
+    display = nickname or f"小红书账号{account_id}"
+    state_str = json.dumps(storage_state, ensure_ascii=False)
+    db.update_account(account_id, {
+        "nickname": display,
+        "xhs_user_id": (xhs_user_id or "").strip(),
+        "avatar_url": avatar_url or "",
+        "status": "valid",
+        "login_data_enc": encrypt_login_data(state_str),
+        "last_check_at": int(time.time()),
+        "check_note": "扫码登录成功",
+    })
+    try:
+        cache = login_cache_dir()
+        cache.mkdir(parents=True, exist_ok=True)
+        (cache / "storage_state.json").write_text(state_str, encoding="utf-8")
+    except Exception:  # noqa: BLE001
+        pass
+    sess = get_manager().get_session(account_id)
+    if sess:
+        sess.status = "success"
+        sess.message = f"登录成功：{display}"
+    return get_manager().status(account_id)
 
 
 def account_health(acc: dict) -> dict:
@@ -258,7 +382,7 @@ def account_health(acc: dict) -> dict:
         "rescan_path": f"/api/accounts/{account_id}/rescan",
     }
     if not acc.get("login_data_enc"):
-        return base
+        return _finish_health(base)
     try:
         state = json.loads(decrypt_login_data(acc["login_data_enc"]))
         cookies = {c.get("name"): c.get("value")
@@ -266,21 +390,21 @@ def account_health(acc: dict) -> dict:
     except Exception:  # noqa: BLE001
         base["code"] = "login_unreadable"
         base["message"] = "登录数据无法读取，请重新扫码。"
-        return base
+        return _finish_health(base)
     missing = [name for name in ("a1", "web_session") if not cookies.get(name)]
     if missing:
         base["code"] = "cookie_incomplete"
         base["message"] = (
             f"登录失效：Cookie 缺少 {'、'.join(missing)}。请重新扫码。"
         )
-        return base
+        return _finish_health(base)
     last = int(acc.get("last_check_at") or 0)
     age = int(time.time()) - last if last else 0
     remind = bool(last and age > 7 * 86400)
     message = "登录态有效（已检测到 a1 与 web_session）。"
     if remind:
         message = "登录态已超过 7 天未复查。建议再点一次检查；采集若失败请重新扫码。"
-    return {
+    return _finish_health({
         "ok": True,
         "account_id": account_id,
         "status": "valid",
@@ -288,7 +412,43 @@ def account_health(acc: dict) -> dict:
         "message": message,
         "remind": remind,
         "rescan_path": f"/api/accounts/{account_id}/rescan",
-    }
+    })
+
+
+def inspect_account(account_id: int) -> dict:
+    """检查账号。扫码还在等待时不把账号写成失效。"""
+    acc = db.get_account(account_id)
+    if not acc:
+        raise KeyError(account_id)
+    sess = get_manager().get_session(account_id)
+    now = int(time.time())
+    if sess and sess.status in ("starting", "waiting", "success"):
+        return sess.snapshot()
+    if sess and sess.status in ("expired", "failed", "cancelled"):
+        if acc.get("status") == "pending":
+            db.update_account(account_id, {
+                "last_check_at": now,
+                "check_note": (sess.message or "")[:180],
+            })
+        return sess.snapshot()
+    health = account_health(acc)
+    db.update_account(account_id, {
+        "status": health["status"],
+        "last_check_at": now,
+        "check_note": health["message"][:180],
+    })
+    return health
+
+
+def decorate_account(acc: dict) -> dict:
+    """账号列表附加对外状态，不改库存的 status（界面仍用 valid/pending/expired）。"""
+    view = dict(acc)
+    sess = get_manager().get_session(acc.get("id"))
+    snap = sess.snapshot() if sess else account_state_payload(acc)
+    view["state"] = snap["state"]
+    view["state_label"] = snap["state_label"]
+    view["login_message"] = snap["message"]
+    return view
 
 
 def decrypt_profile_to_dir(account_id: int, dest: Path) -> bool:

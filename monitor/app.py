@@ -532,9 +532,13 @@ def api_deep_crawl(topic_id: int, body: CrawlIn = CrawlIn()):
         db.set_current_user(uid)
         task_id = db.create_task(topic_id, task_type="deep_crawl", account_id=resolved)
         try:
+            from .task_progress import record_task_progress
             db.update_task(task_id, status="running",
                            started_at=int(time.time()))
+            record_task_progress(task_id, 2, "任务启动中…")
+
             def _progress(pct: int, msg: str):
+                record_task_progress(task_id, pct, msg)
                 if pct >= 0:
                     db.update_task(task_id, log_tail=f"[{pct}%] {msg}")
                 else:
@@ -583,12 +587,14 @@ def api_stop_task(task_id: int):
 
 @app.get("/api/tasks")
 def api_list_tasks(limit: int = Query(50, ge=1, le=200)):
-    return {"items": db.list_tasks(limit)}
+    from .task_progress import present_task
+    return {"items": [present_task(t) for t in db.list_tasks(limit)]}
 
 
 @app.get("/api/tasks/{task_id}")
 def api_get_task(task_id: int):
-    task = db.get_task(task_id)
+    from .task_progress import present_task
+    task = present_task(db.get_task(task_id))
     if not task:
         raise HTTPException(404, "任务不存在")
     return task
@@ -1648,8 +1654,10 @@ def api_chat_stream(body: ChatIn):
 
 @app.get("/api/accounts")
 def api_list_accounts():
-    """账号列表（不含加密登录数据）"""
-    return {"items": db.list_accounts(),
+    """账号列表（不含加密登录数据）。每条带 state / state_label。"""
+    from .login_flow import decorate_account
+    items = [decorate_account(a) for a in db.list_accounts()]
+    return {"items": items,
             "default_id": (db.get_default_account() or {}).get("id")}
 
 
@@ -1659,7 +1667,9 @@ def api_create_account():
     from .login_flow import get_manager
     account_id = db.create_account()
     sess = get_manager().start(account_id)
-    return {"account_id": account_id, "login": sess}
+    return {"account_id": account_id,
+            "state": sess["state"], "state_label": sess["state_label"],
+            "message": sess["message"], "login": sess}
 
 
 @app.delete("/api/accounts/{account_id}")
@@ -1680,33 +1690,45 @@ def api_rescan_account(account_id: int):
         raise HTTPException(404, "账号不存在")
     db.update_account(account_id, {"status": "pending", "check_note": "等待重新扫码"})
     sess = get_manager().start(account_id)
-    return {"account_id": account_id, "login": sess}
+    return {"account_id": account_id,
+            "state": sess["state"], "state_label": sess["state_label"],
+            "message": sess["message"], "login": sess}
 
 
 @app.post("/api/accounts/{account_id}/check")
 def api_check_account(account_id: int):
     """检查账号登录态是否有效"""
-    acc = db.get_account(account_id)
-    if not acc:
+    from .login_flow import inspect_account
+    try:
+        return inspect_account(account_id)
+    except KeyError:
         raise HTTPException(404, "账号不存在")
-    from .login_flow import account_health
-    health = account_health(acc)
-    db.update_account(account_id, {
-        "status": health["status"],
-        "last_check_at": int(__import__("time").time()),
-        "check_note": health["message"][:180],
-    })
-    return health
 
 
 @app.get("/api/login/qrcode")
 def api_login_qrcode(account_id: int):
-    """获取扫码登录二维码（base64，前端弹窗展示）"""
+    """获取扫码登录二维码（base64，前端弹窗展示）。"""
     from .login_flow import get_manager
+    view = get_manager().status(account_id)
     b64 = get_manager().qrcode(account_id)
     if not b64:
-        raise HTTPException(404, "二维码尚未生成或已过期，请重新发起登录")
-    return {"image": f"data:image/png;base64,{b64}"}
+        message = view.get("message") or "二维码尚未生成或已过期，请重新发起登录"
+        return JSONResponse(status_code=404, content={
+            "detail": message,
+            "account_id": account_id,
+            "state": view.get("state") or "waiting",
+            "state_label": view.get("state_label") or "等待扫码",
+            "message": message,
+            "ok": False,
+        })
+    return {
+        "image": f"data:image/png;base64,{b64}",
+        "account_id": account_id,
+        "state": view.get("state"),
+        "state_label": view.get("state_label"),
+        "message": view.get("message") or "请用小红书 App 扫码登录",
+        "ok": bool(view.get("ok")),
+    }
 
 
 class BrowserImportIn(BaseModel):

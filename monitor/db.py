@@ -284,6 +284,8 @@ _MIGRATIONS = {
               "progress": "INTEGER NOT NULL DEFAULT 0",
               "progress_detail": "TEXT DEFAULT ''",
               "cancel_requested": "INTEGER NOT NULL DEFAULT 0",
+              "deleted_count": "INTEGER NOT NULL DEFAULT 0",
+              "updated_at": "INTEGER NOT NULL DEFAULT 0",
               "user_id": "INTEGER"},
     "topic_tags": {"user_id": "INTEGER"},
     "news_sources": {"user_id": "INTEGER"},
@@ -481,6 +483,11 @@ def _migrate(conn: sqlite3.Connection) -> None:
                          (_new, _old))
         except Exception:
             pass
+    # 旧库若重建过 tasks，进度列可能被丢掉，这里再补一次
+    existing = {r["name"] for r in conn.execute("PRAGMA table_info(tasks)").fetchall()}
+    for col, ddl in _MIGRATIONS["tasks"].items():
+        if col not in existing:
+            conn.execute(f"ALTER TABLE tasks ADD COLUMN {col} {ddl}")
 
 
 def _connect() -> sqlite3.Connection:
@@ -1026,14 +1033,37 @@ def stats(topic_id: Optional[int] = None) -> Dict[str, Any]:
                 + (" AND " if nwhere else " WHERE ") + "sentiment=?",
                 (*np, label),
             ).fetchone()[0]
+        active_clause = (" AND " if nwhere else " WHERE ") + (
+            "IFNULL(post_status,'active')!='deleted'")
+        active_notes = conn.execute(
+            f"SELECT COUNT(*) FROM notes {nwhere}{active_clause}", np).fetchone()[0]
+        deleted_notes = conn.execute(
+            f"SELECT COUNT(*) FROM notes {nwhere}"
+            + (" AND " if nwhere else " WHERE ") + "post_status='deleted'",
+            np,
+        ).fetchone()[0]
+        share_not_on_web = conn.execute(
+            f"SELECT COUNT(*) FROM notes {nwhere}{active_clause}"
+            " AND share_count_available=0",
+            np,
+        ).fetchone()[0]
         neg_top = conn.execute(
-            f"SELECT post_id, title, author, liked_count, comment_count, note_url, source_keyword"
-            f" FROM notes {nwhere}" + (" AND " if nwhere else " WHERE ")
-            + "sentiment='negative' ORDER BY (liked_count + comment_count * 3) DESC LIMIT 10",
+            f"SELECT post_id, title, author, liked_count, comment_count, share_count,"
+            f" share_count_available, note_url, source_keyword, publish_time, collected_at,"
+            f" post_status FROM notes {nwhere}{active_clause}"
+            + " AND sentiment='negative'"
+            " ORDER BY (liked_count + comment_count * 3) DESC LIMIT 10",
             np,
         ).fetchall()
         return {
             "total_notes": total_notes,
+            "active_notes": active_notes,
+            "deleted_notes": deleted_notes,
+            "share_not_on_web": share_not_on_web,
+            "time_basis": {
+                "publish_time": "发布时间",
+                "collected_at": "采集时间",
+            },
             "total_comments": total_comments,
             "sentiment_dist": dist,
             "negative_top10": [dict(r) for r in neg_top],

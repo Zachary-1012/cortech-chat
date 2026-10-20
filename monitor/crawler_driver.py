@@ -160,14 +160,9 @@ def _run_task_inner(task_id: int, topic: dict, engine: str, max_notes: Optional[
     def _log(s: str) -> None:
         _append_log(task_id, log_file, s)
 
-    _last_progress = [0]
-
     def _report_progress(pct: int, detail: str) -> None:
-        pct = max(0, min(100, int(pct)))
-        # 节流：进度变化>=2 或 detail 变化才写库
-        if pct - _last_progress[0] >= 2 or pct >= 100:
-            _last_progress[0] = pct
-            db.update_task(task_id, progress=pct, progress_detail=detail)
+        from .task_progress import record_task_progress
+        record_task_progress(task_id, pct, detail)
 
     def _should_stop() -> bool:
         t = db.get_task(task_id)
@@ -284,9 +279,14 @@ def _run_task_inner(task_id: int, topic: dict, engine: str, max_notes: Optional[
         if used_account_id and not collection_fixture_enabled():
             from .account_rotation import mark_success
             mark_success(used_account_id, len(result.notes))
-        db.update_task(task_id, status="done", finished_at=int(time.time()),
+        deleted_n = int(getattr(result, "deleted_count", 0) or 0)
+        finished = int(time.time())
+        from .task_progress import record_task_progress
+        record_task_progress(task_id, 100, "采集完成", deleted_count=deleted_n)
+        db.update_task(task_id, status="done", finished_at=finished,
                         notes_count=n_notes, engine_used=engine_used,
-                        progress=100, progress_detail="采集完成")
+                        progress=100, progress_detail="采集完成",
+                        deleted_count=deleted_n, updated_at=finished)
         _log(f"[ingester] 入库完成：帖子 {n_notes} 条（新增），评论 {n_comments} 条（新增）")
         # 预警联动：任务完成后评估分级预警（失败不影响主流程）
         try:
